@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Optional
 import logging
 from tqdm import tqdm
-
-from vllm_utils import load_model, format_chat_prompt, generate_responses
+import multiprocessing as mp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -89,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=2048,
+        default=512,
         help="Maximum tokens to generate",
     )
     parser.add_argument(
@@ -97,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8192,
         help="Maximum model context length (reduce if OOM)",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for data parallelism (splits roles across GPUs)",
     )
     
     args = parser.parse_args()
@@ -203,6 +208,9 @@ def generate_for_role(
     Returns:
         Number of new items generated
     """
+    # Import here to support deferred loading for multi-GPU
+    from vllm_utils import format_chat_prompt, generate_responses
+    
     output_path.mkdir(parents=True, exist_ok=True)
     output_file = output_path / f"{role}.jsonl"
     
@@ -295,6 +303,8 @@ def save_run_config(output_path: Path, args: argparse.Namespace, timestamp: str)
         "batch_size": args.batch_size,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
+        # Parallelism
+        "num_gpus": args.num_gpus,
         # Run metadata
         "run_name": args.run_name,
         "timestamp": timestamp,
@@ -306,48 +316,31 @@ def save_run_config(output_path: Path, args: argparse.Namespace, timestamp: str)
         json.dump(config, f, indent=2)
 
 
-def main():
-    args = parse_args()
+def worker_fn(gpu_id: int, roles: list[str], args: argparse.Namespace, timestamp: str, output_path: Path):
+    """Worker function that runs on a single GPU."""
+    # IMPORTANT: Set CUDA device before importing vLLM
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
-    # Setup timestamp
-    if args.resume:
-        timestamp = args.timestamp
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Now import vLLM (must be after setting CUDA_VISIBLE_DEVICES)
+    from vllm_utils import load_model
     
-    logger.info(f"Run: {args.run_name}_{timestamp}")
-    
-    # Get role files
-    role_files = get_role_files(args.data_dir, args.roles)
-    
-    # Setup output path
-    output_path = get_output_path(
-        args.output_dir,
-        args.run_name,
-        timestamp,
-        args.model_name,
-        args.checkpoint,
-    )
-    logger.info(f"Output path: {output_path}")
+    worker_logger = logging.getLogger(f"worker_{gpu_id}")
+    worker_logger.info(f"GPU {gpu_id}: Processing {len(roles)} roles")
     
     # Load model
-    logger.info(f"Loading model: {args.model_name} (checkpoint: {args.checkpoint})")
+    worker_logger.info(f"GPU {gpu_id}: Loading model")
     llm, tokenizer = load_model(
-        args.model_name, 
+        args.model_name,
         revision=args.checkpoint,
         max_model_len=args.max_model_len,
     )
     
-    # Save config (on first run or if not exists)
-    output_path.mkdir(parents=True, exist_ok=True)
-    if not (output_path / "config.json").exists():
-        save_run_config(output_path, args, timestamp)
-    
-    # Process each role
+    # Process assigned roles
     total_generated = 0
+    data_dir = Path(args.data_dir)
     
-    for role, role_path in tqdm(sorted(role_files.items()), desc="Roles"):
-        logger.info(f"Processing role: {role}")
+    for role in tqdm(roles, desc=f"GPU {gpu_id}", position=gpu_id):
+        role_path = data_dir / f"{role}.json"
         role_data = load_role_data(role_path)
         
         num_generated = generate_for_role(
@@ -365,7 +358,103 @@ def main():
         
         total_generated += num_generated
     
-    logger.info(f"Done! Generated {total_generated} total items")
+    worker_logger.info(f"GPU {gpu_id}: Done! Generated {total_generated} items")
+    return total_generated
+
+
+def main():
+    args = parse_args()
+    
+    # Setup timestamp
+    if args.resume:
+        timestamp = args.timestamp
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    logger.info(f"Run: {args.run_name}_{timestamp}")
+    
+    # Get role files
+    role_files = get_role_files(args.data_dir, args.roles)
+    all_roles = sorted(role_files.keys())
+    
+    # Setup output path
+    output_path = get_output_path(
+        args.output_dir,
+        args.run_name,
+        timestamp,
+        args.model_name,
+        args.checkpoint,
+    )
+    logger.info(f"Output path: {output_path}")
+    
+    # Save config (on first run or if not exists)
+    output_path.mkdir(parents=True, exist_ok=True)
+    if not (output_path / "config.json").exists():
+        save_run_config(output_path, args, timestamp)
+    
+    if args.num_gpus == 1:
+        # Single GPU: run directly (import here to allow multi-GPU to set CUDA_VISIBLE_DEVICES first)
+        from vllm_utils import load_model
+        
+        logger.info(f"Loading model: {args.model_name} (checkpoint: {args.checkpoint})")
+        llm, tokenizer = load_model(
+            args.model_name,
+            revision=args.checkpoint,
+            max_model_len=args.max_model_len,
+        )
+        
+        total_generated = 0
+        for role, role_path in tqdm(sorted(role_files.items()), desc="Roles"):
+            logger.info(f"Processing role: {role}")
+            role_data = load_role_data(role_path)
+            
+            num_generated = generate_for_role(
+                role=role,
+                role_data=role_data,
+                llm=llm,
+                tokenizer=tokenizer,
+                output_path=output_path,
+                num_rollouts=args.num_rollouts,
+                batch_size=args.batch_size,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                resume=args.resume,
+            )
+            total_generated += num_generated
+        
+        logger.info(f"Done! Generated {total_generated} total items")
+    
+    else:
+        # Multi-GPU: split roles across workers
+        logger.info(f"Using {args.num_gpus} GPUs for data parallelism")
+        
+        # Split roles across GPUs
+        role_chunks = [[] for _ in range(args.num_gpus)]
+        for i, role in enumerate(all_roles):
+            role_chunks[i % args.num_gpus].append(role)
+        
+        for gpu_id, chunk in enumerate(role_chunks):
+            logger.info(f"GPU {gpu_id}: {len(chunk)} roles")
+        
+        # Spawn workers
+        mp.set_start_method("spawn", force=True)
+        
+        processes = []
+        for gpu_id, roles in enumerate(role_chunks):
+            if roles:  # Skip empty chunks
+                p = mp.Process(
+                    target=worker_fn,
+                    args=(gpu_id, roles, args, timestamp, output_path),
+                )
+                p.start()
+                processes.append(p)
+        
+        # Wait for all workers
+        for p in processes:
+            p.join()
+        
+        logger.info("All workers complete!")
+    
     logger.info(f"Output saved to: {output_path}")
 
 
