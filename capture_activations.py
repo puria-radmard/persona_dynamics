@@ -1,8 +1,16 @@
-"""Capture activations from transcripts using HuggingFace."""
+"""Capture activations from transcripts using HuggingFace.
+
+Handles:
+- <role>.jsonl - activations from role system prompts (using shared questions)
+- default.jsonl - activations from default system prompts (using shared questions)
+
+All transcripts use the same shared extraction questions.
+"""
 
 import argparse
 import json
 import os
+import sys
 import torch
 from pathlib import Path
 from typing import Optional
@@ -10,11 +18,12 @@ import logging
 from tqdm import tqdm
 import multiprocessing as mp
 
-# Load .env file if present (for HF_TOKEN, etc.)
 from dotenv import load_dotenv
 _script_dir = Path(__file__).parent.resolve()
 load_dotenv(_script_dir / ".env")
 load_dotenv()
+
+from config import get_model_display_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         "--model-name",
         type=str,
         default="allenai/OLMo-2-7B-Instruct",
-        help="HuggingFace model ID for activation capture (can differ from transcript model)",
+        help="HuggingFace model ID for activation capture",
     )
     parser.add_argument(
         "--checkpoint",
@@ -41,20 +50,26 @@ def parse_args() -> argparse.Namespace:
         "--transcript-dir",
         type=str,
         required=True,
-        help="Directory containing transcript JSONL files (activations saved in subdir)",
+        help="Directory containing transcript JSONL files",
+    )
+    parser.add_argument(
+        "--questions-file",
+        type=str,
+        default="data/extraction_questions.jsonl",
+        help="Path to shared extraction questions JSONL",
     )
     parser.add_argument(
         "--role-data-dir",
         type=str,
         default="data/roles/instructions",
-        help="Directory containing role instruction JSONs",
+        help="Directory containing role instruction JSONs (for system prompts)",
     )
     parser.add_argument(
-        "--roles",
+        "--transcripts",
         type=str,
         nargs="+",
         default=None,
-        help="Specific roles to process (default: all in transcript dir)",
+        help="Specific transcript files to process (default: all in transcript dir)",
     )
     parser.add_argument(
         "--layers",
@@ -76,12 +91,6 @@ def parse_args() -> argparse.Namespace:
         help="How to aggregate over response tokens (none = save all)",
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=1,
-        help="Batch size for processing (1 recommended for memory)",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default="cuda",
@@ -98,10 +107,31 @@ def parse_args() -> argparse.Namespace:
         "--num-gpus",
         type=int,
         default=1,
-        help="Number of GPUs for data parallelism (splits roles across GPUs)",
+        help="Number of GPUs for data parallelism",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip transcripts that already have activation files",
     )
     
     return parser.parse_args()
+
+
+def load_shared_questions(questions_file: str) -> list[str]:
+    """Load shared extraction questions from JSONL file."""
+    questions_path = Path(questions_file)
+    
+    if not questions_path.exists():
+        raise FileNotFoundError(f"Questions file not found: {questions_path}")
+    
+    questions = []
+    with open(questions_path) as f:
+        for line in f:
+            item = json.loads(line)
+            questions.append(item["question"])
+    
+    return questions
 
 
 def load_transcripts(transcript_path: Path) -> list[dict]:
@@ -113,35 +143,68 @@ def load_transcripts(transcript_path: Path) -> list[dict]:
     return transcripts
 
 
-def load_role_data(role_data_dir: Path, role: str) -> dict:
-    """Load role instructions and questions."""
+def load_role_system_prompts(role_data_dir: Path, role: str) -> list[str]:
+    """Load system prompts from a role JSON file."""
     role_path = role_data_dir / f"{role}.json"
     with open(role_path) as f:
-        return json.load(f)
+        role_data = json.load(f)
+    return [instr["pos"] for instr in role_data["instruction"]]
 
 
-def get_roles_to_process(
+def load_default_prompts(role_data_dir: Path, model_name: str) -> list[str]:
+    """Load and format default system prompts."""
+    default_path = role_data_dir / "default.json"
+    
+    if not default_path.exists():
+        raise FileNotFoundError(f"default.json not found at {default_path}")
+    
+    with open(default_path) as f:
+        default_data = json.load(f)
+    
+    display_name = get_model_display_name(model_name)
+    
+    prompts = []
+    for instruction in default_data["instruction"]:
+        prompt = instruction["pos"]
+        if "{model_name}" in prompt:
+            prompt = prompt.format(model_name=display_name)
+        prompts.append(prompt)
+    
+    return prompts
+
+
+def get_transcripts_to_process(
     transcript_dir: Path,
-    roles: Optional[list[str]],
+    transcripts: Optional[list[str]],
 ) -> list[str]:
-    """Get list of roles to process."""
+    """Get list of transcript names (without .jsonl) to process."""
     available = [f.stem for f in transcript_dir.glob("*.jsonl")]
     
-    if roles is None:
-        return available
+    if transcripts is None:
+        return sorted(available)
     
-    # Validate requested roles exist
-    for role in roles:
-        if role not in available:
-            raise FileNotFoundError(f"No transcript found for role: {role}")
+    # Validate requested exist
+    for name in transcripts:
+        if name not in available:
+            raise FileNotFoundError(f"No transcript found: {name}")
     
-    return roles
+    return sorted(transcripts)
 
 
-def process_role(
-    role: str,
+def get_completed_transcripts(output_dir: Path) -> set[str]:
+    """Get set of transcripts that already have activation files."""
+    completed = set()
+    for f in output_dir.glob("*_activations.pt"):
+        name = f.stem.replace("_activations", "")
+        completed.add(name)
+    return completed
+
+
+def process_transcript(
+    transcript_name: str,
     transcripts: list[dict],
-    role_data: dict,
+    system_prompts: list[str],
+    questions: list[str],
     model,
     tokenizer,
     layer_indices: list[int],
@@ -149,34 +212,25 @@ def process_role(
     device: str,
 ) -> dict:
     """
-    Process all transcripts for a role and extract activations.
+    Process all transcripts and extract activations.
     
     Returns:
-        Dict with:
-            - 'activations': dict mapping layer_idx to tensor of shape:
-                - (num_samples, hidden_dim) if aggregation != 'none'
-                - list of (num_tokens, hidden_dim) tensors if aggregation == 'none'
-            - 'metadata': list of dicts with indices for each sample
+        Dict with 'activations' and 'metadata'
     """
     from hf_utils import extract_response_activations
     
-    instructions = role_data["instruction"]
-    questions = role_data["questions"]
-    
-    # Storage for activations per layer
     layer_activations = {layer_idx: [] for layer_idx in layer_indices}
     metadata = []
     
-    for transcript in tqdm(transcripts, desc=f"  {role}", leave=False):
+    for transcript in tqdm(transcripts, desc=f"  {transcript_name}", leave=False):
         sp_idx = transcript["system_prompt_idx"]
         q_idx = transcript["question_idx"]
         r_idx = transcript["rollout_idx"]
         response = transcript["response"]
         
-        system_prompt = instructions[sp_idx]["pos"]
+        system_prompt = system_prompts[sp_idx]
         question = questions[q_idx]
         
-        # Extract activations
         try:
             activations = extract_response_activations(
                 model=model,
@@ -188,19 +242,17 @@ def process_role(
                 device=device,
             )
         except Exception as e:
-            logger.warning(f"  Failed to extract activations for {role} "
+            logger.warning(f"  Failed for {transcript_name} "
                           f"(sp={sp_idx}, q={q_idx}, r={r_idx}): {e}")
             continue
         
-        # Aggregate and store
         for layer_idx, acts in activations.items():
-            # acts shape: (num_response_tokens, hidden_dim)
             if aggregation == "mean":
-                aggregated = acts.mean(dim=0)  # (hidden_dim,)
+                aggregated = acts.mean(dim=0)
             elif aggregation == "last":
-                aggregated = acts[-1]  # (hidden_dim,)
-            else:  # none
-                aggregated = acts  # (num_tokens, hidden_dim)
+                aggregated = acts[-1]
+            else:
+                aggregated = acts
             
             layer_activations[layer_idx].append(aggregated)
         
@@ -210,15 +262,14 @@ def process_role(
             "rollout_idx": r_idx,
         })
     
-    # Stack activations if aggregated
+    # Stack if aggregated
     result_activations = {}
     for layer_idx, acts_list in layer_activations.items():
-        if aggregation != "none":
-            # Stack into (num_samples, hidden_dim)
-            result_activations[layer_idx] = torch.stack(acts_list, dim=0)
-        else:
-            # Keep as list of variable-length tensors
-            result_activations[layer_idx] = acts_list
+        if acts_list:
+            if aggregation != "none":
+                result_activations[layer_idx] = torch.stack(acts_list, dim=0)
+            else:
+                result_activations[layer_idx] = acts_list
     
     return {
         "activations": result_activations,
@@ -226,55 +277,43 @@ def process_role(
     }
 
 
-def save_activations(
-    output_dir: Path,
-    role: str,
-    data: dict,
-    aggregation: str,
-):
-    """Save activations and metadata for a role."""
+def save_activations(output_dir: Path, name: str, data: dict):
+    """Save activations and metadata."""
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save activations
-    activations_file = output_dir / f"{role}_activations.pt"
+    activations_file = output_dir / f"{name}_activations.pt"
     torch.save(data["activations"], activations_file)
     
-    # Save metadata
-    metadata_file = output_dir / f"{role}_metadata.json"
+    metadata_file = output_dir / f"{name}_metadata.json"
     with open(metadata_file, "w") as f:
         json.dump(data["metadata"], f)
     
-    logger.info(f"  Saved {len(data['metadata'])} samples to {output_dir}")
+    logger.info(f"  Saved {len(data['metadata'])} samples for {name}")
 
 
 def worker_fn(
     gpu_id: int,
-    roles: list[str],
+    transcript_names: list[str],
     args: argparse.Namespace,
     output_dir: Path,
     transcript_dir: Path,
     role_data_dir: Path,
+    questions: list[str],
+    default_prompts: list[str],
 ):
-    """Worker function that runs on a single GPU."""
-    # Load .env in worker process too
+    """Worker function for a single GPU."""
     from dotenv import load_dotenv
     _script_dir = Path(__file__).parent.resolve()
     load_dotenv(_script_dir / ".env")
     load_dotenv()
     
-    # Set CUDA device before importing model utilities
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
-    from hf_utils import (
-        load_hf_model,
-        extract_response_activations,
-        get_num_layers,
-    )
+    from hf_utils import load_hf_model, get_num_layers
     
     worker_logger = logging.getLogger(f"worker_{gpu_id}")
-    worker_logger.info(f"GPU {gpu_id}: Processing {len(roles)} roles")
+    worker_logger.info(f"GPU {gpu_id}: Processing {len(transcript_names)} transcripts")
     
-    # Get dtype
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
@@ -282,16 +321,14 @@ def worker_fn(
     }
     torch_dtype = dtype_map[args.dtype]
     
-    # Load model
     worker_logger.info(f"GPU {gpu_id}: Loading model")
     model, tokenizer = load_hf_model(
         args.model_name,
         revision=args.checkpoint,
-        device="cuda",  # Always cuda:0 since we set CUDA_VISIBLE_DEVICES
+        device="cuda",
         torch_dtype=torch_dtype,
     )
     
-    # Determine layers
     num_layers = get_num_layers(model)
     if args.all_layers:
         layer_indices = list(range(num_layers))
@@ -302,16 +339,22 @@ def worker_fn(
     
     worker_logger.info(f"GPU {gpu_id}: Capturing layers {layer_indices}")
     
-    # Process assigned roles
-    for role in tqdm(roles, desc=f"GPU {gpu_id}", position=gpu_id):
-        transcript_path = transcript_dir / f"{role}.jsonl"
+    for transcript_name in tqdm(transcript_names, desc=f"GPU {gpu_id}", position=gpu_id):
+        # Load transcripts
+        transcript_path = transcript_dir / f"{transcript_name}.jsonl"
         transcripts = load_transcripts(transcript_path)
-        role_data = load_role_data(role_data_dir, role)
         
-        data = process_role(
-            role=role,
+        # Get system prompts
+        if transcript_name == "default":
+            system_prompts = default_prompts
+        else:
+            system_prompts = load_role_system_prompts(role_data_dir, transcript_name)
+        
+        data = process_transcript(
+            transcript_name=transcript_name,
             transcripts=transcripts,
-            role_data=role_data,
+            system_prompts=system_prompts,
+            questions=questions,
             model=model,
             tokenizer=tokenizer,
             layer_indices=layer_indices,
@@ -319,7 +362,7 @@ def worker_fn(
             device="cuda",
         )
         
-        save_activations(output_dir, role, data, args.aggregation)
+        save_activations(output_dir, transcript_name, data)
     
     worker_logger.info(f"GPU {gpu_id}: Done!")
 
@@ -330,23 +373,46 @@ def main():
     transcript_dir = Path(args.transcript_dir)
     role_data_dir = Path(args.role_data_dir)
     
-    # Construct output dir: transcript_dir/activations/<model_name>/<checkpoint>
+    # Output dir structure: transcript_dir/activations/<model>/<checkpoint>
     model_name_safe = args.model_name.replace("/", "_")
     checkpoint_safe = args.checkpoint if args.checkpoint else "main"
     output_dir = transcript_dir / "activations" / model_name_safe / checkpoint_safe
     
-    # Validate directories
+    # Validate
     if not transcript_dir.exists():
         raise FileNotFoundError(f"Transcript directory not found: {transcript_dir}")
     if not role_data_dir.exists():
         raise FileNotFoundError(f"Role data directory not found: {role_data_dir}")
     
-    # Get roles to process
-    roles = get_roles_to_process(transcript_dir, args.roles)
-    logger.info(f"Processing {len(roles)} roles")
-    logger.info(f"Output path: {output_dir}")
+    # Load shared questions
+    questions = load_shared_questions(args.questions_file)
+    logger.info(f"Loaded {len(questions)} shared extraction questions")
     
-    # Create output dir and save config
+    # Load default prompts
+    default_prompts = load_default_prompts(role_data_dir, args.model_name)
+    logger.info(f"Loaded {len(default_prompts)} default system prompts")
+    
+    # Get transcripts to process
+    transcripts_to_process = get_transcripts_to_process(transcript_dir, args.transcripts)
+    logger.info(f"Found {len(transcripts_to_process)} transcript files")
+    
+    # Filter if resuming
+    if args.resume:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        completed = get_completed_transcripts(output_dir)
+        if completed:
+            logger.info(f"Resuming: {len(completed)} already completed")
+            transcripts_to_process = [t for t in transcripts_to_process if t not in completed]
+            logger.info(f"Remaining: {len(transcripts_to_process)} to process")
+    
+    if not transcripts_to_process:
+        logger.info("All transcripts already processed!")
+        return
+    
+    logger.info(f"Processing {len(transcripts_to_process)} transcripts")
+    logger.info(f"Output: {output_dir}")
+    
+    # Save config
     output_dir.mkdir(parents=True, exist_ok=True)
     config = {
         "model_name": args.model_name,
@@ -356,21 +422,18 @@ def main():
         "all_layers": args.all_layers,
         "aggregation": args.aggregation,
         "transcript_dir": str(transcript_dir),
+        "questions_file": args.questions_file,
         "role_data_dir": str(role_data_dir),
-        "roles": args.roles,
         "num_gpus": args.num_gpus,
-        "output_dir": str(output_dir),
+        "num_questions": len(questions),
     }
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
     
+    # --- Execution ---
+    
     if args.num_gpus == 1:
-        # Single GPU mode
-        from hf_utils import (
-            load_hf_model,
-            extract_response_activations,
-            get_num_layers,
-        )
+        from hf_utils import load_hf_model, get_num_layers
         
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -394,27 +457,28 @@ def main():
             layer_indices = list(range(num_layers))
         elif args.layers is not None:
             layer_indices = args.layers
-            for idx in layer_indices:
-                if idx < 0 or idx >= num_layers:
-                    raise ValueError(f"Invalid layer index {idx}. Must be in [0, {num_layers})")
         else:
             layer_indices = [num_layers // 2]
         
         logger.info(f"Capturing layers: {layer_indices}")
         
-        for role in tqdm(roles, desc="Roles"):
-            logger.info(f"Processing role: {role}")
-            
-            transcript_path = transcript_dir / f"{role}.jsonl"
+        for transcript_name in tqdm(transcripts_to_process, desc="Transcripts"):
+            transcript_path = transcript_dir / f"{transcript_name}.jsonl"
             transcripts = load_transcripts(transcript_path)
-            role_data = load_role_data(role_data_dir, role)
             
-            logger.info(f"  Loaded {len(transcripts)} transcripts")
+            # Get system prompts
+            if transcript_name == "default":
+                system_prompts = default_prompts
+            else:
+                system_prompts = load_role_system_prompts(role_data_dir, transcript_name)
             
-            data = process_role(
-                role=role,
+            logger.info(f"Processing: {transcript_name} ({len(transcripts)} samples)")
+            
+            data = process_transcript(
+                transcript_name=transcript_name,
                 transcripts=transcripts,
-                role_data=role_data,
+                system_prompts=system_prompts,
+                questions=questions,
                 model=model,
                 tokenizer=tokenizer,
                 layer_indices=layer_indices,
@@ -422,39 +486,50 @@ def main():
                 device=args.device,
             )
             
-            save_activations(output_dir, role, data, args.aggregation)
+            save_activations(output_dir, transcript_name, data)
         
         logger.info("Done!")
     
     else:
-        # Multi-GPU mode
-        logger.info(f"Using {args.num_gpus} GPUs for data parallelism")
+        # Multi-GPU
+        logger.info(f"Using {args.num_gpus} GPUs")
         
-        # Split roles across GPUs
-        role_chunks = [[] for _ in range(args.num_gpus)]
-        for i, role in enumerate(roles):
-            role_chunks[i % args.num_gpus].append(role)
+        # Round-robin split
+        chunks = [[] for _ in range(args.num_gpus)]
+        for i, name in enumerate(transcripts_to_process):
+            chunks[i % args.num_gpus].append(name)
         
-        for gpu_id, chunk in enumerate(role_chunks):
-            logger.info(f"GPU {gpu_id}: {len(chunk)} roles")
+        for i, chunk in enumerate(chunks):
+            logger.info(f"GPU {i}: {len(chunk)} transcripts")
         
-        # Spawn workers
         mp.set_start_method("spawn", force=True)
         
         processes = []
-        for gpu_id, chunk_roles in enumerate(role_chunks):
-            if chunk_roles:
+        for gpu_id, chunk in enumerate(chunks):
+            if chunk:
                 p = mp.Process(
                     target=worker_fn,
-                    args=(gpu_id, chunk_roles, args, output_dir, transcript_dir, role_data_dir),
+                    args=(gpu_id, chunk, args, output_dir, transcript_dir, role_data_dir, 
+                          questions, default_prompts),
                 )
                 p.start()
-                processes.append(p)
+                processes.append((gpu_id, p))
         
-        for p in processes:
+        # Wait and check exit codes
+        failed = []
+        for gpu_id, p in processes:
             p.join()
+            if p.exitcode != 0:
+                failed.append((gpu_id, p.exitcode))
+        
+        if failed:
+            for gpu_id, code in failed:
+                logger.error(f"GPU {gpu_id} FAILED (exit code {code})")
+            sys.exit(1)
         
         logger.info("All workers complete!")
+    
+    logger.info(f"Output saved to: {output_dir}")
 
 
 if __name__ == "__main__":
