@@ -10,6 +10,13 @@ import logging
 from tqdm import tqdm
 import multiprocessing as mp
 
+# Load .env file if present (for HF_TOKEN, etc.)
+from dotenv import load_dotenv
+# Look for .env in script directory and current directory
+_script_dir = Path(__file__).parent.resolve()
+load_dotenv(_script_dir / ".env")  # script directory
+load_dotenv()  # also try current directory
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -318,6 +325,12 @@ def save_run_config(output_path: Path, args: argparse.Namespace, timestamp: str)
 
 def worker_fn(gpu_id: int, roles: list[str], args: argparse.Namespace, timestamp: str, output_path: Path):
     """Worker function that runs on a single GPU."""
+    # Load .env in worker process too (spawn doesn't inherit everything)
+    from dotenv import load_dotenv
+    _script_dir = Path(__file__).parent.resolve()
+    load_dotenv(_script_dir / ".env")
+    load_dotenv()
+    
     # IMPORTANT: Set CUDA device before importing vLLM
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
