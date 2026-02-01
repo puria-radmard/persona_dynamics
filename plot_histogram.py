@@ -52,6 +52,19 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for role selection",
     )
+    parser.add_argument(
+        "--filtering-dir",
+        type=str,
+        default=None,
+        help="Directory containing filtering results (optional)",
+    )
+    parser.add_argument(
+        "--minimum-rating",
+        type=int,
+        default=2,
+        choices=[1, 2, 3],
+        help="Minimum judge rating to include (default: 2)",
+    )
     
     return parser.parse_args()
 
@@ -98,6 +111,106 @@ def get_activation_files(activations_dir: Path) -> tuple[list[Path], Path | None
             role_files.append(f)
     
     return sorted(role_files), default_file
+
+
+def load_filtering_results(filtering_dir: Path, role_name: str) -> list[dict] | None:
+    """Load filtering results for a role. Returns None if file doesn't exist."""
+    filtering_path = filtering_dir / f"{role_name}.jsonl"
+    if not filtering_path.exists():
+        return None
+    
+    results = []
+    with open(filtering_path) as f:
+        for line in f:
+            results.append(json.loads(line))
+    return results
+
+
+def get_passing_indices(
+    filtering_results: list[dict],
+    minimum_rating: int,
+) -> set[tuple[int, int, int]]:
+    """Get set of (sp_idx, q_idx, r_idx) tuples that pass the filter."""
+    passing = set()
+    for r in filtering_results:
+        try:
+            # Parse judge response - might be "3" or "3\n" or have extra text
+            response = r.get("judge_response", "")
+            if response is None:
+                continue
+            # Extract first digit found
+            rating = None
+            for char in response.strip():
+                if char.isdigit():
+                    rating = int(char)
+                    break
+            
+            if rating is not None and rating >= minimum_rating:
+                key = (r["system_prompt_idx"], r["question_idx"], r["rollout_idx"])
+                passing.add(key)
+        except (ValueError, KeyError):
+            continue
+    return passing
+
+
+def load_activation_mean_filtered(
+    activations_path: Path,
+    metadata_path: Path,
+    layer_idx: int,
+    passing_indices: set[tuple[int, int, int]] | None,
+) -> tuple[torch.Tensor | None, int, int]:
+    """
+    Load activations and compute mean, optionally filtering by passing indices.
+    
+    Returns:
+        (mean_activation, num_kept, num_total)
+    """
+    try:
+        activations = torch.load(activations_path, map_location="cpu")
+        
+        if layer_idx not in activations:
+            return None, 0, 0
+        
+        layer_acts = activations[layer_idx]
+        
+        # Load metadata to map indices
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        
+        num_total = len(metadata)
+        
+        if passing_indices is None:
+            # No filtering - use all
+            if isinstance(layer_acts, list):
+                all_acts = torch.cat([a.mean(dim=0, keepdim=True) for a in layer_acts], dim=0)
+                mean_act = all_acts.mean(dim=0)
+            else:
+                mean_act = layer_acts.mean(dim=0)
+            return mean_act.float(), num_total, num_total
+        
+        # Filter based on passing indices
+        kept_acts = []
+        for i, meta in enumerate(metadata):
+            key = (meta["system_prompt_idx"], meta["question_idx"], meta["rollout_idx"])
+            if key in passing_indices:
+                if isinstance(layer_acts, list):
+                    kept_acts.append(layer_acts[i].mean(dim=0))
+                else:
+                    kept_acts.append(layer_acts[i])
+        
+        num_kept = len(kept_acts)
+        
+        if num_kept == 0:
+            return None, 0, num_total
+        
+        stacked = torch.stack(kept_acts, dim=0)
+        mean_act = stacked.mean(dim=0)
+        
+        return mean_act.float(), num_kept, num_total
+        
+    except Exception as e:
+        logger.warning(f"Failed to load {activations_path}: {e}")
+        return None, 0, 0
 
 
 def select_highlighted_roles(
@@ -151,6 +264,15 @@ def main():
     if not activations_dir.exists():
         raise FileNotFoundError(f"Activations directory not found: {activations_dir}")
     
+    # Setup filtering if provided
+    filtering_dir = Path(args.filtering_dir) if args.filtering_dir else None
+    if filtering_dir and not filtering_dir.exists():
+        raise FileNotFoundError(f"Filtering directory not found: {filtering_dir}")
+    
+    if filtering_dir:
+        logger.info(f"Filtering enabled: {filtering_dir}")
+        logger.info(f"Minimum rating: {args.minimum_rating}")
+    
     # Separate role and default files
     role_files, default_file = get_activation_files(activations_dir)
     logger.info(f"Found {len(role_files)} role files")
@@ -175,17 +297,62 @@ def main():
     
     logger.info(f"Using layer {layer_idx}")
     
-    # Load role means
+    # Load role means (with optional filtering)
     role_means = {}
+    role_counts = {}  # Track (kept, total) for each role
+    roles_missing_filtering = []
+    roles_no_passing = []
+    
     for f in tqdm(role_files, desc="Loading role activations"):
         name = f.stem.replace("_activations", "")
-        mean_act = load_activation_mean(f, layer_idx)
+        metadata_path = f.parent / f"{name}_metadata.json"
+        
+        # Get filtering info if enabled
+        passing_indices = None
+        if filtering_dir:
+            filtering_results = load_filtering_results(filtering_dir, name)
+            if filtering_results is None:
+                roles_missing_filtering.append(name)
+                continue  # Skip this role - no filtering info
+            passing_indices = get_passing_indices(filtering_results, args.minimum_rating)
+            if len(passing_indices) == 0:
+                roles_no_passing.append(name)
+                continue  # Skip - no samples pass the filter
+        
+        mean_act, num_kept, num_total = load_activation_mean_filtered(
+            f, metadata_path, layer_idx, passing_indices
+        )
+        
         if mean_act is not None:
             role_means[name] = mean_act.numpy()
+            role_counts[name] = (num_kept, num_total)
     
-    logger.info(f"Loaded {len(role_means)} role means")
+    # Report filtering results
+    if filtering_dir:
+        if roles_missing_filtering:
+            print(f"\n⚠️  Roles skipped (no filtering data yet): {len(roles_missing_filtering)}")
+            if len(roles_missing_filtering) <= 20:
+                print(f"   {', '.join(sorted(roles_missing_filtering))}")
+            else:
+                print(f"   {', '.join(sorted(roles_missing_filtering)[:10])}, ... and {len(roles_missing_filtering) - 10} more")
+        
+        if roles_no_passing:
+            print(f"\n⚠️  Roles skipped (no samples with rating >= {args.minimum_rating}): {len(roles_no_passing)}")
+            if len(roles_no_passing) <= 20:
+                print(f"   {', '.join(sorted(roles_no_passing))}")
+        
+        # Summary stats
+        total_kept = sum(c[0] for c in role_counts.values())
+        total_samples = sum(c[1] for c in role_counts.values())
+        print(f"\n✓ Loaded {len(role_means)} roles with filtering")
+        print(f"  Samples kept: {total_kept:,} / {total_samples:,} ({100*total_kept/total_samples:.1f}%)")
+    else:
+        logger.info(f"Loaded {len(role_means)} role means (no filtering)")
     
-    # Load default (assistant) vector
+    if len(role_means) == 0:
+        raise ValueError("No roles loaded! Check filtering settings or wait for more batch results.")
+    
+    # Load default (assistant) vector - no filtering applied
     assistant_vector = load_activation_mean(default_file, layer_idx)
     if assistant_vector is None:
         raise ValueError("Failed to load default activations")
@@ -305,6 +472,15 @@ def main():
     
     ax.set_title(f'Variance & Assistant Contribution (Axis↔PC1: {axis_pc1_cosine:.2f})')
     
+    # Add figure title with filtering info
+    if filtering_dir:
+        total_kept = sum(c[0] for c in role_counts.values())
+        total_samples = sum(c[1] for c in role_counts.values())
+        suptitle = f"PCA of {len(roles)} roles (filtered: rating ≥ {args.minimum_rating}, {total_kept:,}/{total_samples:,} samples)"
+    else:
+        suptitle = f"PCA of {len(roles)} roles (unfiltered)"
+    fig.suptitle(suptitle, fontsize=14, fontweight='bold', y=1.02)
+    
     plt.tight_layout()
     
     # Save plot
@@ -326,11 +502,20 @@ def main():
         "layer": layer_idx,
         "n_roles": len(role_means),
         "n_components": pca.n_components_,
+        "filtering": {
+            "enabled": filtering_dir is not None,
+            "minimum_rating": args.minimum_rating if filtering_dir else None,
+            "roles_missing_filtering": roles_missing_filtering if filtering_dir else [],
+            "roles_no_passing": roles_no_passing if filtering_dir else [],
+            "total_samples_kept": sum(c[0] for c in role_counts.values()) if role_counts else None,
+            "total_samples": sum(c[1] for c in role_counts.values()) if role_counts else None,
+        },
         "explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
         "cumulative_variance": np.cumsum(pca.explained_variance_ratio_).tolist(),
         "assistant_axis_pc1_cosine": axis_pc1_cosine,
         "assistant_norm": float(assistant_norm_for_results),
         "roles": roles,
+        "role_sample_counts": {r: {"kept": c[0], "total": c[1]} for r, c in role_counts.items()} if role_counts else {},
         "assistant_projections": {
             f"PC{i+1}": float(assistant_projection[i]) 
             for i in range(min(10, len(assistant_projection)))
@@ -360,6 +545,15 @@ def main():
     print("=" * 60)
     print(f"Roles: {len(role_means)}")
     print(f"Layer: {layer_idx}")
+    
+    if filtering_dir:
+        total_kept = sum(c[0] for c in role_counts.values())
+        total_samples = sum(c[1] for c in role_counts.values())
+        print(f"\nFiltering: rating ≥ {args.minimum_rating}")
+        print(f"  Samples: {total_kept:,} / {total_samples:,} ({100*total_kept/total_samples:.1f}% kept)")
+        if roles_missing_filtering:
+            print(f"  Roles skipped (no filtering data): {len(roles_missing_filtering)}")
+    
     print(f"\nAssistant Axis ↔ PC1 cosine similarity: {axis_pc1_cosine:.3f}")
     print(f"  (Paper reports >0.71 at middle layer)")
     print(f"\nVariance explained:")
