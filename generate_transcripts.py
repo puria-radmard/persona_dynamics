@@ -40,7 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         type=str,
-        default="allenai/OLMo-2-7B-Instruct",
+        required=True,
+        # default="allenai/OLMo-2-7B-Instruct",
         help="HuggingFace model ID",
     )
     parser.add_argument(
@@ -106,19 +107,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
+        default=2048,
         help="Maximum tokens to generate",
     )
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=4096,
+        default=4096 * 2,
         help="Maximum model context length",
     )
     parser.add_argument(
         "--num-gpus",
         type=int,
-        default=1,
+        default=2,
         help="Number of GPUs for parallel processing",
     )
     parser.add_argument(
@@ -363,6 +364,7 @@ def worker_fn(
     load_dotenv()
     
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["VLLM_CACHE_ROOT"] = f"/tmp/vllm_cache_gpu_{gpu_id}"
     
     from vllm_utils import load_model
     

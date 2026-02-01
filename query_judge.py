@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt-5-mini-2025-08-07",
+        default="gpt-4.1-mini-2025-04-14",
         help="OpenAI model for judging",
     )
     parser.add_argument(
@@ -218,7 +218,7 @@ def count_tokens(text: str) -> int:
     """Count tokens in text using tiktoken."""
     try:
         import tiktoken
-        # GPT-5 mini likely uses cl100k_base or similar
+        # GPT-4 mini likely uses cl100k_base or similar
         encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
     except ImportError:
@@ -228,25 +228,39 @@ def count_tokens(text: str) -> int:
 
 def mode_dry(
     requests: list[dict],
+    transcript_names: list[str],
     seed: int,
 ):
-    """Dry run: print stats and example queries."""
+    """Dry run: print stats, chunking plan, and example queries."""
     random.seed(seed)
     
     total_requests = len(requests)
     
-    # Count tokens
-    total_tokens = 0
-    for req in tqdm(requests, desc="Counting tokens"):
-        content = req["body"]["messages"][0]["content"]
-        total_tokens += count_tokens(content)
+    # Compute chunking plan (this also counts tokens)
+    print("\n" + "=" * 60)
+    print("CHUNKING PLAN")
+    print("=" * 60)
+    
+    chunks = chunk_requests_by_tokens(requests, transcript_names)
+    
+    total_tokens = sum(chunk["token_count"] for chunk in chunks)
+    
+    for i, chunk in enumerate(chunks, 1):
+        chunk_name = get_chunk_filename(chunk)
+        start_idx, end_idx = chunk["request_indices"]
+        print(f"\nChunk {i}: {chunk_name}")
+        print(f"  Roles: {len(chunk['roles'])} ({chunk['start_role']} → {chunk['end_role']})")
+        print(f"  Requests: {end_idx - start_idx:,}")
+        print(f"  Tokens: {chunk['token_count']:,}")
+        print(f"  Est. file size: {chunk['estimated_file_size_mb']:.1f} MB")
     
     print("\n" + "=" * 60)
     print("DRY RUN SUMMARY")
     print("=" * 60)
     print(f"Total requests: {total_requests:,}")
     print(f"Total input tokens: {total_tokens:,}")
-    print(f"Estimated cost (gpt-5-mini @ $0.125/1M input): ${total_tokens * 0.125 / 1_000_000:.2f}")
+    print(f"Number of chunks: {len(chunks)}")
+    print(f"Estimated cost (gpt-4.1-mini batch @ $0.20/1M input): ${total_tokens * 0.20 / 1_000_000:.2f}")
     print(f"\nScoring scale (from eval_prompt):")
     print(f"  0 = Not role-playing, refuses as AI")
     print(f"  1 = Not role-playing, answers as AI") 
@@ -265,66 +279,252 @@ def mode_dry(
         print(f"Prompt ({len(content)} chars):\n{content}")
 
 
+def chunk_requests_by_tokens(
+    requests: list[dict],
+    transcript_names: list[str],
+    max_tokens: int = 35_000_000,
+    max_file_size_mb: int = 150,
+) -> list[dict]:
+    """
+    Chunk requests by role, respecting token and file size limits.
+    
+    Returns list of chunk info dicts:
+    {
+        "start_role": "addict",
+        "end_role": "fool", 
+        "roles": ["addict", "advocate", ..., "fool"],
+        "request_indices": (0, 45000),  # slice indices into requests list
+        "token_count": 34_500_000,
+        "estimated_file_size_mb": 140,
+    }
+    """
+    # Group requests by role (they're already sorted by role from build_batch_requests)
+    role_boundaries = []  # List of (role_name, start_idx, end_idx, token_count)
+    
+    current_role = None
+    start_idx = 0
+    role_tokens = 0
+    
+    for i, req in tqdm(enumerate(requests), total=len(requests), desc="Computing chunks"):
+        role_name = req["custom_id"].split("|")[0]
+        
+        if role_name != current_role:
+            if current_role is not None:
+                role_boundaries.append((current_role, start_idx, i, role_tokens))
+            current_role = role_name
+            start_idx = i
+            role_tokens = 0
+        
+        role_tokens += count_tokens(req["body"]["messages"][0]["content"])
+    
+    # Don't forget the last role
+    if current_role is not None:
+        role_boundaries.append((current_role, start_idx, len(requests), role_tokens))
+    
+    # Now chunk roles together respecting limits
+    chunks = []
+    chunk_roles = []
+    chunk_start_idx = 0
+    chunk_tokens = 0
+    chunk_size_estimate = 0
+    
+    for role_name, start_idx, end_idx, role_token_count in role_boundaries:
+        # Estimate file size: ~200 bytes overhead per request + content
+        role_requests = requests[start_idx:end_idx]
+        role_size_estimate = sum(
+            len(json.dumps(req)) for req in role_requests
+        ) / (1024 * 1024)  # MB
+        
+        # Check if adding this role would exceed limits
+        would_exceed_tokens = (chunk_tokens + role_token_count) > max_tokens
+        would_exceed_size = (chunk_size_estimate + role_size_estimate) > max_file_size_mb
+        
+        if chunk_roles and (would_exceed_tokens or would_exceed_size):
+            # Save current chunk and start new one
+            chunks.append({
+                "start_role": chunk_roles[0],
+                "end_role": chunk_roles[-1],
+                "roles": chunk_roles,
+                "request_indices": (chunk_start_idx, start_idx),
+                "token_count": chunk_tokens,
+                "estimated_file_size_mb": chunk_size_estimate,
+            })
+            chunk_roles = []
+            chunk_start_idx = start_idx
+            chunk_tokens = 0
+            chunk_size_estimate = 0
+        
+        chunk_roles.append(role_name)
+        chunk_tokens += role_token_count
+        chunk_size_estimate += role_size_estimate
+    
+    # Don't forget the last chunk
+    if chunk_roles:
+        chunks.append({
+            "start_role": chunk_roles[0],
+            "end_role": chunk_roles[-1],
+            "roles": chunk_roles,
+            "request_indices": (chunk_start_idx, len(requests)),
+            "token_count": chunk_tokens,
+            "estimated_file_size_mb": chunk_size_estimate,
+        })
+    
+    return chunks
+
+
+def get_chunk_filename(chunk: dict) -> str:
+    """Get base filename for a chunk (without extension)."""
+    return f"{chunk['start_role']}_{chunk['end_role']}"
+
+
+def load_batch_infos(filtering_dir: Path) -> dict[str, dict]:
+    """Load all batch_info_*.json files. Returns {chunk_name: info_dict}."""
+    infos = {}
+    for f in filtering_dir.glob("batch_info_*.json"):
+        chunk_name = f.stem.replace("batch_info_", "")
+        with open(f) as fp:
+            infos[chunk_name] = json.load(fp)
+    return infos
+
+
 def mode_send(
     requests: list[dict],
     filtering_dir: Path,
     model: str,
+    transcript_names: list[str],
 ):
-    """Submit batch job to OpenAI."""
+    """Submit batch job to OpenAI with chunking support."""
     import openai
     
     client = openai.OpenAI()
-    
-    # Write batch input file
-    batch_input_path = filtering_dir / "batch_input.jsonl"
     filtering_dir.mkdir(parents=True, exist_ok=True)
     
-    with open(batch_input_path, "w") as f:
-        for req in requests:
-            f.write(json.dumps(req) + "\n")
+    # Check if chunks already exist
+    existing_infos = load_batch_infos(filtering_dir)
     
-    logger.info(f"Wrote {len(requests)} requests to {batch_input_path}")
+    if existing_infos:
+        # Chunks already created - find next to send
+        logger.info(f"Found {len(existing_infos)} existing chunk(s)")
+        
+        # Check if any batch is currently in-flight
+        in_flight = [name for name, info in existing_infos.items() if info.get("status") == "sent"]
+        if in_flight:
+            print(f"\nError: Batch '{in_flight[0]}' is still in-flight.")
+            print(f"Run --mode receive first to complete it.")
+            return
+        
+        # Find first unsent chunk
+        # Sort by start_role to maintain alphabetical order
+        sorted_chunks = sorted(existing_infos.items(), key=lambda x: x[0])
+        unsent = [(name, info) for name, info in sorted_chunks if info.get("status") is None]
+        
+        if not unsent:
+            completed = [name for name, info in existing_infos.items() if info.get("status") == "completed"]
+            print(f"\nAll {len(completed)} batches already completed!")
+            return
+        
+        chunk_name, chunk_info = unsent[0]
+        logger.info(f"Sending chunk: {chunk_name}")
+        
+        # Load the batch input file
+        batch_input_path = filtering_dir / f"batch_input_{chunk_name}.jsonl"
+        if not batch_input_path.exists():
+            raise FileNotFoundError(f"Batch input file not found: {batch_input_path}")
+        
+    else:
+        # First time - create all chunks
+        logger.info("Creating chunks...")
+        chunks = chunk_requests_by_tokens(requests, transcript_names)
+        
+        logger.info(f"Created {len(chunks)} chunks:")
+        for chunk in chunks:
+            chunk_name = get_chunk_filename(chunk)
+            logger.info(f"  {chunk_name}: {len(chunk['roles'])} roles, "
+                       f"{chunk['token_count']:,} tokens, "
+                       f"{chunk['estimated_file_size_mb']:.1f}MB")
+        
+        # Write all batch input files and batch info files
+        for chunk in tqdm(chunks, desc="Writing chunk files"):
+            chunk_name = get_chunk_filename(chunk)
+            start_idx, end_idx = chunk["request_indices"]
+            chunk_requests = requests[start_idx:end_idx]
+            
+            # Write batch input
+            batch_input_path = filtering_dir / f"batch_input_{chunk_name}.jsonl"
+            with open(batch_input_path, "w") as f:
+                for req in chunk_requests:
+                    f.write(json.dumps(req) + "\n")
+            
+            # Write batch info (status: null = not yet sent)
+            batch_info = {
+                "chunk_name": chunk_name,
+                "start_role": chunk["start_role"],
+                "end_role": chunk["end_role"],
+                "roles": chunk["roles"],
+                "num_requests": end_idx - start_idx,
+                "token_count": chunk["token_count"],
+                "estimated_file_size_mb": chunk["estimated_file_size_mb"],
+                "model": model,
+                "status": None,  # null = created but not sent
+                "batch_id": None,
+                "input_file_id": None,
+                "created_at": datetime.now().isoformat(),
+            }
+            batch_info_path = filtering_dir / f"batch_info_{chunk_name}.json"
+            with open(batch_info_path, "w") as f:
+                json.dump(batch_info, f, indent=2)
+        
+        logger.info(f"Wrote all chunk files to {filtering_dir}")
+        
+        # Send the first chunk
+        chunk = chunks[0]
+        chunk_name = get_chunk_filename(chunk)
+        batch_input_path = filtering_dir / f"batch_input_{chunk_name}.jsonl"
+        chunk_info = None  # Will reload below
     
-    # Upload file
-    logger.info("Uploading batch input file...")
+    # Upload and send
+    logger.info(f"Uploading {batch_input_path.name}...")
     with open(batch_input_path, "rb") as f:
         uploaded_file = client.files.create(file=f, purpose="batch")
     
     logger.info(f"Uploaded file: {uploaded_file.id}")
     
-    # Create batch job
     logger.info("Creating batch job...")
     batch = client.batches.create(
         input_file_id=uploaded_file.id,
         endpoint="/v1/chat/completions",
         completion_window="24h",
         metadata={
-            "description": f"Judge filtering for {filtering_dir.parent.name}",
+            "description": f"Judge filtering: {chunk_name}",
             "model": model,
-            "num_requests": str(len(requests)),
         }
     )
     
     logger.info(f"Created batch: {batch.id}")
     logger.info(f"Status: {batch.status}")
     
-    # Save batch info
-    batch_info = {
-        "batch_id": batch.id,
-        "input_file_id": uploaded_file.id,
-        "status": batch.status,
-        "created_at": datetime.now().isoformat(),
-        "num_requests": len(requests),
-        "model": model,
-    }
+    # Update batch info
+    batch_info_path = filtering_dir / f"batch_info_{chunk_name}.json"
+    with open(batch_info_path) as f:
+        batch_info = json.load(f)
     
-    batch_info_path = filtering_dir / "batch_info.json"
+    batch_info["status"] = "sent"
+    batch_info["batch_id"] = batch.id
+    batch_info["input_file_id"] = uploaded_file.id
+    batch_info["sent_at"] = datetime.now().isoformat()
+    
     with open(batch_info_path, "w") as f:
         json.dump(batch_info, f, indent=2)
     
-    logger.info(f"Saved batch info to {batch_info_path}")
+    # Check how many remain
+    all_infos = load_batch_infos(filtering_dir)
+    remaining = sum(1 for info in all_infos.values() if info.get("status") is None)
+    completed = sum(1 for info in all_infos.values() if info.get("status") == "completed")
+    
     print(f"\nBatch submitted! ID: {batch.id}")
-    print(f"Run with --mode receive to check status and download results.")
+    print(f"Chunk: {chunk_name}")
+    print(f"Progress: {completed}/{len(all_infos)} completed, {remaining} remaining after this one")
+    print(f"\nRun --mode receive to poll for completion.")
 
 
 def mode_receive(
@@ -335,24 +535,44 @@ def mode_receive(
     
     client = openai.OpenAI()
     
-    # Load batch info
-    batch_info_path = filtering_dir / "batch_info.json"
-    if not batch_info_path.exists():
-        raise FileNotFoundError(
-            f"No batch_info.json found at {batch_info_path}. "
-            "Run with --mode send first."
-        )
+    # Load all batch infos
+    all_infos = load_batch_infos(filtering_dir)
     
-    with open(batch_info_path) as f:
-        batch_info = json.load(f)
+    if not all_infos:
+        print(f"\nNo batches found in {filtering_dir}")
+        print("Run --mode send first to create and submit batches.")
+        return
     
-    batch_id = batch_info["batch_id"]
-    logger.info(f"Checking batch: {batch_id}")
+    # Find the in-flight batch
+    in_flight = [(name, info) for name, info in all_infos.items() if info.get("status") == "sent"]
+    
+    if not in_flight:
+        # Check if all completed or all unsent
+        completed = [name for name, info in all_infos.items() if info.get("status") == "completed"]
+        unsent = [name for name, info in all_infos.items() if info.get("status") is None]
+        
+        if unsent:
+            print(f"\nNo batch currently in-flight.")
+            print(f"  Completed: {len(completed)}/{len(all_infos)}")
+            print(f"  Unsent: {len(unsent)}")
+            print(f"\nRun --mode send to submit the next batch.")
+        else:
+            print(f"\nAll {len(completed)} batches completed!")
+        return
+    
+    if len(in_flight) > 1:
+        logger.warning(f"Multiple batches in-flight (unexpected): {[name for name, _ in in_flight]}")
+    
+    chunk_name, chunk_info = in_flight[0]
+    batch_id = chunk_info["batch_id"]
+    
+    logger.info(f"Checking batch: {chunk_name} (ID: {batch_id})")
     
     # Get current status
     batch = client.batches.retrieve(batch_id)
     
-    print(f"\nBatch ID: {batch.id}")
+    print(f"\nBatch: {chunk_name}")
+    print(f"Batch ID: {batch.id}")
     print(f"Status: {batch.status}")
     print(f"Requests: {batch.request_counts.completed}/{batch.request_counts.total} completed")
     if batch.request_counts.failed > 0:
@@ -370,12 +590,12 @@ def mode_receive(
         file_response = client.files.content(output_file_id)
         output_content = file_response.text
         
-        # Save raw results
-        results_path = filtering_dir / "batch_results.jsonl"
+        # Save raw results for this chunk
+        results_path = filtering_dir / f"batch_results_{chunk_name}.jsonl"
         with open(results_path, "w") as f:
             f.write(output_content)
         
-        logger.info(f"Saved results to {results_path}")
+        logger.info(f"Saved raw results to {results_path}")
         
         # Parse and organize results by role
         results_by_role = {}
@@ -403,21 +623,35 @@ def mode_receive(
         # Save per-role results
         for role_name, role_results in results_by_role.items():
             role_results_path = filtering_dir / f"{role_name}.jsonl"
-            with open(role_results_path, "w") as f:
+            
+            # Append if file exists (from previous chunks), otherwise create
+            mode = "a" if role_results_path.exists() else "w"
+            with open(role_results_path, mode) as f:
                 for r in role_results:
                     f.write(json.dumps(r) + "\n")
         
         logger.info(f"Saved results for {len(results_by_role)} roles")
         
         # Update batch info
-        batch_info["status"] = "completed"
-        batch_info["completed_at"] = datetime.now().isoformat()
-        batch_info["output_file_id"] = output_file_id
+        batch_info_path = filtering_dir / f"batch_info_{chunk_name}.json"
+        chunk_info["status"] = "completed"
+        chunk_info["completed_at"] = datetime.now().isoformat()
+        chunk_info["output_file_id"] = output_file_id
         with open(batch_info_path, "w") as f:
-            json.dump(batch_info, f, indent=2)
+            json.dump(chunk_info, f, indent=2)
         
-        print(f"\nResults saved to {filtering_dir}/")
-        print(f"Per-role JSONLs: {len(results_by_role)} files")
+        # Show overall progress
+        all_infos = load_batch_infos(filtering_dir)  # Reload
+        completed = sum(1 for info in all_infos.values() if info.get("status") == "completed")
+        remaining = sum(1 for info in all_infos.values() if info.get("status") is None)
+        
+        print(f"\nResults saved!")
+        print(f"Progress: {completed}/{len(all_infos)} completed, {remaining} remaining")
+        
+        if remaining > 0:
+            print(f"\nRun --mode send to submit the next batch.")
+        else:
+            print(f"\nAll batches completed!")
         
     elif batch.status == "failed":
         print("\nBatch failed!")
@@ -478,9 +712,9 @@ def main():
     
     # Execute mode
     if args.mode == "dry":
-        mode_dry(requests, args.seed)
+        mode_dry(requests, transcript_names, args.seed)
     elif args.mode == "send":
-        mode_send(requests, filtering_dir, args.model)
+        mode_send(requests, filtering_dir, args.model, transcript_names)
 
 
 if __name__ == "__main__":

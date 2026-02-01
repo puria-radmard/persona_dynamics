@@ -4,6 +4,7 @@
 # Used for {model_name} placeholder in default system prompts
 MODEL_DISPLAY_NAMES = {
     "allenai/Olmo-3-7B-Instruct": "OLMo 3",
+    "allenai/Olmo-3.1-32B-Instruct": "OLMo 3",
     "allenai/OLMo-2-1124-7B-Instruct": "OLMo 2",
     "allenai/OLMo-2-7B-Instruct": "OLMo 2",
     "Qwen/Qwen2.5-7B-Instruct": "Qwen 2.5",

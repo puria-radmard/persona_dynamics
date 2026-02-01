@@ -1,17 +1,19 @@
 # Chain with && so failures stop the pipeline
 # Add --resume for robustness if interrupted
 
-python -m generate_transcripts \
-    --run-name wdef \
-    --model-name allenai/Olmo-3-7B-Instruct \
-    --batch-size 64 \
-    --num-gpus 2 \
-    --max-model-len 4096 \
-    --resume \
-&& python -m capture_activations \
-    --transcript-dir outputs/transcripts/wdef/allenai_Olmo-3-7B-Instruct/main \
-    --model-name allenai/Olmo-3-7B-Instruct \
+source /workspace/setup_env.sh
+
+# python -m generate_transcripts \
+#     --run-name upgrade \
+#     --model-name allenai/Olmo-3.1-32B-Instruct \
+#     --batch-size 128 \
+#     --num-gpus 2 \
+#     --resume \
+# && 
+python -m capture_activations \
+    --transcript-dir outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main \
+    --model-name allenai/Olmo-3.1-32B-Instruct \
     --num-gpus 2 \
     --resume \
 && python -m plot_histogram \
-    --activations-dir outputs/transcripts/wdef/allenai_Olmo-3-7B-Instruct/main/activations/allenai_Olmo-3-7B-Instruct/main
+    --activations-dir outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main/activations/allenai_Olmo-3.1-32B-Instruct/main
