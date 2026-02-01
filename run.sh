@@ -4,7 +4,7 @@
 python -m generate_transcripts \
     --run-name wdef \
     --model-name allenai/Olmo-3-7B-Instruct \
-    --batch-size 32 \
+    --batch-size 64 \
     --num-gpus 2 \
     --max-model-len 4096 \
     --resume \

@@ -268,27 +268,42 @@ def main():
         if pc_idx == 0:
             ax.legend(loc='upper right')
     
-    # Cumulative variance explained
+    # Cumulative variance explained + Assistant squared contribution per PC
     ax = axes[3]
+    
+    # Compute squared contribution for each PC: (a_i / ||a||)^2
+    # This measures: what fraction of the assistant's squared distance from role centroid is along PC i?
+    # These sum to 1 across all PCs (Pythagorean theorem)
+    n_pcs_to_show = min(50, role_projections.shape[1])
+    assistant_norm = np.linalg.norm(assistant_projection)
+    squared_contributions = (assistant_projection[:n_pcs_to_show] / assistant_norm) ** 2
+    
+    # Plot cumulative variance (left axis)
     cumvar = np.cumsum(pca.explained_variance_ratio_) * 100
-    ax.plot(range(1, len(cumvar) + 1), cumvar, 'o-', color='steelblue', 
-            linewidth=2, markersize=4)
-    ax.fill_between(range(1, len(cumvar) + 1), cumvar, alpha=0.3, color='steelblue')
-    ax.set_xlabel('Number of components')
-    ax.set_ylabel('Cumulative variance explained (%)')
-    ax.set_title(f'Cumulative Variance (Assistant Axis ↔ PC1: {axis_pc1_cosine:.2f})')
-    ax.set_xlim(0.5, min(50, len(cumvar)) + 0.5)
+    ax.plot(range(1, n_pcs_to_show + 1), cumvar[:n_pcs_to_show], 'o-', color='steelblue', 
+            linewidth=2, markersize=4, label='Cumulative variance')
+    ax.fill_between(range(1, n_pcs_to_show + 1), cumvar[:n_pcs_to_show], alpha=0.2, color='steelblue')
+    ax.set_xlabel('Principal Component')
+    ax.set_ylabel('Cumulative variance explained (%)', color='steelblue')
+    ax.tick_params(axis='y', labelcolor='steelblue')
+    ax.set_xlim(0.5, n_pcs_to_show + 0.5)
     ax.set_ylim(0, 100)
     ax.grid(True, alpha=0.3)
     
-    # Add individual variance as bars
+    # Plot squared contribution on secondary y-axis
     ax2 = ax.twinx()
-    n_bars = min(50, len(pca.explained_variance_ratio_))
-    ax2.bar(range(1, n_bars + 1), 
-            pca.explained_variance_ratio_[:n_bars] * 100,
-            alpha=0.3, color='coral')
-    ax2.set_ylabel('Individual variance (%)', color='coral')
+    ax2.plot(range(1, n_pcs_to_show + 1), squared_contributions * 100, 's-', color='coral',
+             linewidth=2, markersize=4, label='Assistant (aᵢ/||a||)²')
+    ax2.set_ylabel('Assistant squared contribution (%)', color='coral')
     ax2.tick_params(axis='y', labelcolor='coral')
+    ax2.set_ylim(0, min(100, max(squared_contributions) * 120))  # Scale to show variation
+    
+    # Combined legend
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='center right', fontsize=8)
+    
+    ax.set_title(f'Variance & Assistant Contribution (Axis↔PC1: {axis_pc1_cosine:.2f})')
     
     plt.tight_layout()
     
@@ -302,6 +317,10 @@ def main():
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     logger.info(f"Saved plot to {output_path}")
     
+    # Compute squared contributions for results
+    assistant_norm_for_results = np.linalg.norm(assistant_projection)
+    squared_contribs_for_results = (assistant_projection / assistant_norm_for_results) ** 2
+    
     # Save results JSON
     results = {
         "layer": layer_idx,
@@ -310,9 +329,18 @@ def main():
         "explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
         "cumulative_variance": np.cumsum(pca.explained_variance_ratio_).tolist(),
         "assistant_axis_pc1_cosine": axis_pc1_cosine,
+        "assistant_norm": float(assistant_norm_for_results),
         "roles": roles,
         "assistant_projections": {
             f"PC{i+1}": float(assistant_projection[i]) 
+            for i in range(min(10, len(assistant_projection)))
+        },
+        "assistant_percentile": {
+            f"PC{i+1}": float((role_projections[:, i] < assistant_projection[i]).mean() * 100)
+            for i in range(min(10, len(assistant_projection)))
+        },
+        "assistant_squared_contribution": {
+            f"PC{i+1}": float(squared_contribs_for_results[i] * 100)
             for i in range(min(10, len(assistant_projection)))
         },
         "role_projections": {
@@ -337,9 +365,23 @@ def main():
     print(f"\nVariance explained:")
     for i in range(min(5, len(pca.explained_variance_ratio_))):
         print(f"  PC{i+1}: {pca.explained_variance_ratio_[i]*100:.1f}%")
-    print(f"\nAssistant projection:")
-    for i in range(min(3, len(assistant_projection))):
-        print(f"  PC{i+1}: {assistant_projection[i]:.3f}")
+    
+    # Compute squared contributions for summary
+    assistant_norm = np.linalg.norm(assistant_projection)
+    squared_contribs = (assistant_projection / assistant_norm) ** 2
+    
+    print(f"\nAssistant position (projection a onto PCs, centered at role mean):")
+    print(f"  ||a|| = {assistant_norm:.3f}")
+    print(f"  (aᵢ/||a||)² sums to 1 across all PCs")
+    for i in range(min(5, len(assistant_projection))):
+        pc_values = role_projections[:, i]
+        assistant_pc = assistant_projection[i]
+        prop_below = (pc_values < assistant_pc).mean()
+        sq_contrib = squared_contribs[i]
+        print(f"  PC{i+1}: {assistant_pc:+.3f}  (percentile: {prop_below*100:.1f}%, contribution: {sq_contrib*100:.1f}%)")
+    
+    print(f"\nCumulative contribution (first 5 PCs): {squared_contribs[:5].sum()*100:.1f}%")
+    print(f"  (If Assistant Axis ≈ PC1, expect PC1 to dominate)")
 
 
 if __name__ == "__main__":
