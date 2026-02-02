@@ -6,6 +6,7 @@ TRANSCRIPT_DIR="outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main"
 BASE_MODEL="allenai/OLMo-3-1125-32B"
 TOKENIZER="allenai/OLMo-3.1-32B-Instruct"
 NUM_GPUS=2
+BATCH_SIZE=16  # Adjust based on VRAM - start with 16, try 32 if no OOM
 
 # List of checkpoints to process
 CHECKPOINTS=(
@@ -31,6 +32,7 @@ for CHECKPOINT in "${CHECKPOINTS[@]}"; do
         --transcript-dir "$TRANSCRIPT_DIR" \
         --minimum-rating 2 \
         --num-gpus "$NUM_GPUS" \
+        --batch-size "$BATCH_SIZE" \
         --resume
     
     # Check exit code

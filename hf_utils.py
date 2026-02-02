@@ -140,7 +140,7 @@ def get_response_token_mask(
     response_end = len(full_ids)
     
     return torch.tensor(full_ids), response_start, response_end
-    
+
 
 class ActivationCapture:
     """Context manager for capturing activations from model layers."""
@@ -282,6 +282,106 @@ def extract_response_activations(
         response_activations[layer_idx] = response_acts
     
     return response_activations
+
+
+def extract_response_activations_batched(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    system_prompts: list[str],
+    user_messages: list[str],
+    assistant_responses: list[str],
+    layer_indices: list[int],
+    device: str = "cuda",
+) -> list[dict[int, torch.Tensor] | None]:
+    """
+    Extract activations for response tokens for a batch of conversations.
+    
+    This is more efficient than calling extract_response_activations repeatedly
+    because it processes all samples in a single forward pass.
+    
+    Args:
+        model: HuggingFace model
+        tokenizer: Tokenizer
+        system_prompts: List of system prompts
+        user_messages: List of user messages
+        assistant_responses: List of assistant responses
+        layer_indices: Which layers to capture
+        device: Device for inference
+        
+    Returns:
+        List of dicts, each mapping layer index to activation tensor.
+        Returns None for items that failed processing.
+    """
+    batch_size = len(system_prompts)
+    assert len(user_messages) == batch_size
+    assert len(assistant_responses) == batch_size
+    
+    # Get token IDs and response boundaries for each item
+    all_full_ids = []
+    response_boundaries = []  # List of (start, end) tuples
+    
+    for i in range(batch_size):
+        full_ids, response_start, response_end = get_response_token_mask(
+            tokenizer, system_prompts[i], user_messages[i], assistant_responses[i]
+        )
+        all_full_ids.append(full_ids)
+        response_boundaries.append((response_start, response_end))
+    
+    # Pad sequences to same length (left padding for causal LM)
+    max_len = max(ids.size(0) for ids in all_full_ids)
+    
+    # Get pad token id
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    
+    # Create padded batch with attention mask
+    padded_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+    
+    # Track offset for each sequence due to left padding
+    padding_offsets = []
+    
+    for i, ids in enumerate(all_full_ids):
+        seq_len = ids.size(0)
+        offset = max_len - seq_len  # Left padding offset
+        padding_offsets.append(offset)
+        padded_ids[i, offset:] = ids
+        attention_mask[i, offset:] = 1
+    
+    # Run forward pass with activation capture
+    with torch.no_grad():
+        with ActivationCapture(model, layer_indices) as capture:
+            input_ids = padded_ids.to(device)
+            attn_mask = attention_mask.to(device)
+            model(input_ids, attention_mask=attn_mask)
+            
+            activations = capture.get_activations()
+    
+    # Extract response activations for each item
+    results = []
+    
+    for i in range(batch_size):
+        try:
+            offset = padding_offsets[i]
+            response_start, response_end = response_boundaries[i]
+            
+            # Adjust for padding offset
+            adj_start = offset + response_start
+            adj_end = offset + response_end
+            
+            item_activations = {}
+            for layer_idx, acts in activations.items():
+                # acts shape: (batch_size, seq_len, hidden_dim)
+                response_acts = acts[i, adj_start:adj_end, :]
+                item_activations[layer_idx] = response_acts
+            
+            results.append(item_activations)
+            
+        except Exception as e:
+            results.append(None)
+    
+    return results
 
 
 def get_num_layers(model: AutoModelForCausalLM) -> int:
