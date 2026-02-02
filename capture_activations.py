@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=[1, 2, 3],
         help="Minimum judge rating to include. Requires filtering results to exist. "
-             "If filtering-dir exists but this is not set, no filtering is applied.",
+             "Roles without filtering data will be SKIPPED (use --resume to fill in later).",
     )
     
     return parser.parse_args()
@@ -266,41 +266,40 @@ def get_passing_indices(
     return passing
 
 
+def get_roles_with_filtering(filtering_dir: Path) -> set[str]:
+    """Get set of role names that have filtering results."""
+    return {f.stem for f in filtering_dir.glob("*.jsonl")}
+
+
 def filter_transcripts(
     transcripts: list[dict],
     filtering_dir: Path,
     transcript_name: str,
     minimum_rating: int,
-    worker_logger,
-) -> list[dict]:
+) -> tuple[list[dict] | None, str]:
     """
     Filter transcripts based on judge ratings.
     
-    Returns filtered list, or original list if no filtering data available.
+    Returns:
+        (filtered_transcripts, status_message)
+        filtered_transcripts is None if role should be skipped (no filtering data)
     """
     filtering_results = load_filtering_results(filtering_dir, transcript_name)
     
     if filtering_results is None:
-        worker_logger.warning(f"  No filtering data for {transcript_name}, using all samples")
-        return transcripts
+        return None, f"no filtering data (skipped, use --resume later)"
     
     passing = get_passing_indices(filtering_results, minimum_rating)
     
     if len(passing) == 0:
-        worker_logger.warning(f"  No samples pass rating >= {minimum_rating} for {transcript_name}")
-        return []
+        return [], f"no samples with rating >= {minimum_rating}"
     
     filtered = [
         t for t in transcripts
         if (t["system_prompt_idx"], t["question_idx"], t["rollout_idx"]) in passing
     ]
     
-    worker_logger.info(
-        f"  Filtered {transcript_name}: {len(filtered)}/{len(transcripts)} "
-        f"samples (rating >= {minimum_rating})"
-    )
-    
-    return filtered
+    return filtered, f"{len(filtered)}/{len(transcripts)} samples (rating >= {minimum_rating})"
 
 
 # --- Main processing ---
@@ -456,6 +455,10 @@ def worker_fn(
     
     worker_logger.info(f"GPU {gpu_id}: Capturing layers {layer_indices}")
     
+    skipped_no_filtering = []
+    skipped_no_passing = []
+    processed = []
+    
     for transcript_name in tqdm(transcript_names, desc=f"GPU {gpu_id}", position=gpu_id):
         # Load transcripts
         transcript_path = transcript_dir / f"{transcript_name}.jsonl"
@@ -463,16 +466,24 @@ def worker_fn(
         
         # Apply filtering if enabled
         if filtering_dir and args.minimum_rating:
-            transcripts = filter_transcripts(
+            filtered, status = filter_transcripts(
                 transcripts=transcripts,
                 filtering_dir=filtering_dir,
                 transcript_name=transcript_name,
                 minimum_rating=args.minimum_rating,
-                worker_logger=worker_logger,
             )
-            if not transcripts:
-                worker_logger.warning(f"  Skipping {transcript_name}: no samples after filtering")
+            
+            if filtered is None:
+                # No filtering data - skip this role
+                skipped_no_filtering.append(transcript_name)
                 continue
+            elif len(filtered) == 0:
+                # No samples pass filter
+                skipped_no_passing.append(transcript_name)
+                continue
+            else:
+                transcripts = filtered
+                worker_logger.info(f"  {transcript_name}: {status}")
         
         # Get system prompts
         if transcript_name == "default":
@@ -494,10 +505,17 @@ def worker_fn(
         
         if data["metadata"]:  # Only save if we have data
             save_activations(output_dir, transcript_name, data)
+            processed.append(transcript_name)
         else:
             worker_logger.warning(f"  No activations captured for {transcript_name}")
     
+    # Summary
     worker_logger.info(f"GPU {gpu_id}: Done!")
+    worker_logger.info(f"  Processed: {len(processed)}")
+    if skipped_no_filtering:
+        worker_logger.info(f"  Skipped (no filtering data): {len(skipped_no_filtering)}")
+    if skipped_no_passing:
+        worker_logger.info(f"  Skipped (no passing samples): {len(skipped_no_passing)}")
 
 
 def main():
@@ -537,7 +555,9 @@ def main():
         if not filtering_dir.exists():
             raise FileNotFoundError(f"Filtering directory not found: {filtering_dir}")
         if args.minimum_rating:
+            roles_with_filtering = get_roles_with_filtering(filtering_dir)
             logger.info(f"Filtering enabled: minimum rating >= {args.minimum_rating}")
+            logger.info(f"  Roles with filtering data: {len(roles_with_filtering)}")
         else:
             logger.info(f"Filtering dir exists but --minimum-rating not set, no filtering applied")
             filtering_dir = None
@@ -567,6 +587,17 @@ def main():
     if not transcripts_to_process:
         logger.info("All transcripts already processed!")
         return
+    
+    # Preview filtering impact
+    if filtering_dir and args.minimum_rating:
+        roles_with_filtering = get_roles_with_filtering(filtering_dir)
+        will_process = [t for t in transcripts_to_process if t in roles_with_filtering]
+        will_skip = [t for t in transcripts_to_process if t not in roles_with_filtering]
+        logger.info(f"With current filtering data:")
+        logger.info(f"  Will process: {len(will_process)} roles")
+        logger.info(f"  Will skip (no filtering data yet): {len(will_skip)} roles")
+        if will_skip and len(will_skip) <= 10:
+            logger.info(f"    Skipped roles: {', '.join(sorted(will_skip))}")
     
     logger.info(f"Processing {len(transcripts_to_process)} transcripts")
     logger.info(f"Output: {output_dir}")
@@ -642,22 +673,33 @@ def main():
         
         logger.info(f"Capturing layers: {layer_indices}")
         
+        skipped_no_filtering = []
+        skipped_no_passing = []
+        processed = []
+        
         for transcript_name in tqdm(transcripts_to_process, desc="Transcripts"):
             transcript_path = transcript_dir / f"{transcript_name}.jsonl"
             transcripts = load_transcripts(transcript_path)
             
             # Apply filtering if enabled
             if filtering_dir and args.minimum_rating:
-                transcripts = filter_transcripts(
+                filtered, status = filter_transcripts(
                     transcripts=transcripts,
                     filtering_dir=filtering_dir,
                     transcript_name=transcript_name,
                     minimum_rating=args.minimum_rating,
-                    worker_logger=logger,
                 )
-                if not transcripts:
-                    logger.warning(f"Skipping {transcript_name}: no samples after filtering")
+                
+                if filtered is None:
+                    # No filtering data - skip
+                    skipped_no_filtering.append(transcript_name)
                     continue
+                elif len(filtered) == 0:
+                    skipped_no_passing.append(transcript_name)
+                    continue
+                else:
+                    transcripts = filtered
+                    logger.info(f"  {transcript_name}: {status}")
             
             # Get system prompts
             if transcript_name == "default":
@@ -681,10 +723,20 @@ def main():
             
             if data["metadata"]:
                 save_activations(output_dir, transcript_name, data)
+                processed.append(transcript_name)
             else:
                 logger.warning(f"No activations captured for {transcript_name}")
         
-        logger.info("Done!")
+        # Final summary
+        logger.info("=" * 60)
+        logger.info("Summary:")
+        logger.info(f"  Processed: {len(processed)}")
+        if skipped_no_filtering:
+            logger.info(f"  Skipped (no filtering data): {len(skipped_no_filtering)}")
+            logger.info(f"    Run --resume after more filtering batches complete")
+        if skipped_no_passing:
+            logger.info(f"  Skipped (no passing samples): {len(skipped_no_passing)}")
+        logger.info("=" * 60)
     
     else:
         # Multi-GPU
@@ -724,6 +776,7 @@ def main():
             sys.exit(1)
         
         logger.info("All workers complete!")
+        logger.info("If roles were skipped due to missing filtering data, run again with --resume")
     
     logger.info(f"Output saved to: {output_dir}")
 

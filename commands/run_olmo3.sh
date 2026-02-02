@@ -18,4 +18,4 @@ python -m capture_activations \
 
 # Assuming filtering done already!
 
-# python -m plot_histogram --activations-dir outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main/activations/allenai_Olmo-3.1-32B-Instruct/main/ --filtering-dir outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main/filtering/ --minimum-rating 2
+# python -m plot_histogram --activations-dir outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main/activations/allenai_Olmo-3.1-32B-Instruct/main/ --filtering-dir outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main/filtering/ --minimum-rating 3
