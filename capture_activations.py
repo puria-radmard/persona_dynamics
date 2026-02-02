@@ -41,6 +41,14 @@ def parse_args() -> argparse.Namespace:
         help="HuggingFace model ID for activation capture",
     )
     parser.add_argument(
+        "--tokenizer-name",
+        type=str,
+        default=None,
+        help="HuggingFace tokenizer ID (default: same as model-name). "
+             "Use this when capturing activations from a base model but "
+             "transcripts were generated with an instruct model.",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
@@ -113,6 +121,23 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         action="store_true",
         help="Skip transcripts that already have activation files",
+    )
+    
+    # Filtering options
+    parser.add_argument(
+        "--filtering-dir",
+        type=str,
+        default=None,
+        help="Directory containing filtering results (to skip low-rated samples). "
+             "If not specified, checks for 'filtering' subdirectory in transcript-dir.",
+    )
+    parser.add_argument(
+        "--minimum-rating",
+        type=int,
+        default=None,
+        choices=[1, 2, 3],
+        help="Minimum judge rating to include. Requires filtering results to exist. "
+             "If filtering-dir exists but this is not set, no filtering is applied.",
     )
     
     return parser.parse_args()
@@ -199,6 +224,86 @@ def get_completed_transcripts(output_dir: Path) -> set[str]:
         completed.add(name)
     return completed
 
+
+# --- Filtering utilities (from plot_pca.py) ---
+
+def load_filtering_results(filtering_dir: Path, role_name: str) -> list[dict] | None:
+    """Load filtering results for a role. Returns None if file doesn't exist."""
+    filtering_path = filtering_dir / f"{role_name}.jsonl"
+    if not filtering_path.exists():
+        return None
+    
+    results = []
+    with open(filtering_path) as f:
+        for line in f:
+            results.append(json.loads(line))
+    return results
+
+
+def get_passing_indices(
+    filtering_results: list[dict],
+    minimum_rating: int,
+) -> set[tuple[int, int, int]]:
+    """Get set of (sp_idx, q_idx, r_idx) tuples that pass the filter."""
+    passing = set()
+    for r in filtering_results:
+        try:
+            response = r.get("judge_response", "")
+            if response is None:
+                continue
+            # Extract first digit found
+            rating = None
+            for char in response.strip():
+                if char.isdigit():
+                    rating = int(char)
+                    break
+            
+            if rating is not None and rating >= minimum_rating:
+                key = (r["system_prompt_idx"], r["question_idx"], r["rollout_idx"])
+                passing.add(key)
+        except (ValueError, KeyError):
+            continue
+    return passing
+
+
+def filter_transcripts(
+    transcripts: list[dict],
+    filtering_dir: Path,
+    transcript_name: str,
+    minimum_rating: int,
+    worker_logger,
+) -> list[dict]:
+    """
+    Filter transcripts based on judge ratings.
+    
+    Returns filtered list, or original list if no filtering data available.
+    """
+    filtering_results = load_filtering_results(filtering_dir, transcript_name)
+    
+    if filtering_results is None:
+        worker_logger.warning(f"  No filtering data for {transcript_name}, using all samples")
+        return transcripts
+    
+    passing = get_passing_indices(filtering_results, minimum_rating)
+    
+    if len(passing) == 0:
+        worker_logger.warning(f"  No samples pass rating >= {minimum_rating} for {transcript_name}")
+        return []
+    
+    filtered = [
+        t for t in transcripts
+        if (t["system_prompt_idx"], t["question_idx"], t["rollout_idx"]) in passing
+    ]
+    
+    worker_logger.info(
+        f"  Filtered {transcript_name}: {len(filtered)}/{len(transcripts)} "
+        f"samples (rating >= {minimum_rating})"
+    )
+    
+    return filtered
+
+
+# --- Main processing ---
 
 def process_transcript(
     transcript_name: str,
@@ -300,6 +405,7 @@ def worker_fn(
     role_data_dir: Path,
     questions: list[str],
     default_prompts: list[str],
+    filtering_dir: Optional[Path],
 ):
     """Worker function for a single GPU."""
     from dotenv import load_dotenv
@@ -310,6 +416,7 @@ def worker_fn(
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
     from hf_utils import load_hf_model, get_num_layers
+    from transformers import AutoTokenizer
     
     worker_logger = logging.getLogger(f"worker_{gpu_id}")
     worker_logger.info(f"GPU {gpu_id}: Processing {len(transcript_names)} transcripts")
@@ -329,6 +436,16 @@ def worker_fn(
         torch_dtype=torch_dtype,
     )
     
+    # Override tokenizer if specified (for base model + instruct tokenizer)
+    if args.tokenizer_name:
+        worker_logger.info(f"GPU {gpu_id}: Loading separate tokenizer from {args.tokenizer_name}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name,
+            trust_remote_code=True,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    
     num_layers = get_num_layers(model)
     if args.all_layers:
         layer_indices = list(range(num_layers))
@@ -343,6 +460,19 @@ def worker_fn(
         # Load transcripts
         transcript_path = transcript_dir / f"{transcript_name}.jsonl"
         transcripts = load_transcripts(transcript_path)
+        
+        # Apply filtering if enabled
+        if filtering_dir and args.minimum_rating:
+            transcripts = filter_transcripts(
+                transcripts=transcripts,
+                filtering_dir=filtering_dir,
+                transcript_name=transcript_name,
+                minimum_rating=args.minimum_rating,
+                worker_logger=worker_logger,
+            )
+            if not transcripts:
+                worker_logger.warning(f"  Skipping {transcript_name}: no samples after filtering")
+                continue
         
         # Get system prompts
         if transcript_name == "default":
@@ -362,7 +492,10 @@ def worker_fn(
             device="cuda",
         )
         
-        save_activations(output_dir, transcript_name, data)
+        if data["metadata"]:  # Only save if we have data
+            save_activations(output_dir, transcript_name, data)
+        else:
+            worker_logger.warning(f"  No activations captured for {transcript_name}")
     
     worker_logger.info(f"GPU {gpu_id}: Done!")
 
@@ -384,12 +517,38 @@ def main():
     if not role_data_dir.exists():
         raise FileNotFoundError(f"Role data directory not found: {role_data_dir}")
     
+    # Setup filtering
+    filtering_dir = None
+    if args.filtering_dir:
+        filtering_dir = Path(args.filtering_dir)
+    elif args.minimum_rating:
+        # Check for default filtering location
+        default_filtering = transcript_dir / "filtering"
+        if default_filtering.exists():
+            filtering_dir = default_filtering
+            logger.info(f"Using default filtering dir: {filtering_dir}")
+        else:
+            raise ValueError(
+                f"--minimum-rating specified but no filtering dir found. "
+                f"Either specify --filtering-dir or run query_judge first."
+            )
+    
+    if filtering_dir:
+        if not filtering_dir.exists():
+            raise FileNotFoundError(f"Filtering directory not found: {filtering_dir}")
+        if args.minimum_rating:
+            logger.info(f"Filtering enabled: minimum rating >= {args.minimum_rating}")
+        else:
+            logger.info(f"Filtering dir exists but --minimum-rating not set, no filtering applied")
+            filtering_dir = None
+    
     # Load shared questions
     questions = load_shared_questions(args.questions_file)
     logger.info(f"Loaded {len(questions)} shared extraction questions")
     
-    # Load default prompts
-    default_prompts = load_default_prompts(role_data_dir, args.model_name)
+    # Load default prompts (use tokenizer model name for display name if specified)
+    display_model = args.tokenizer_name if args.tokenizer_name else args.model_name
+    default_prompts = load_default_prompts(role_data_dir, display_model)
     logger.info(f"Loaded {len(default_prompts)} default system prompts")
     
     # Get transcripts to process
@@ -412,10 +571,18 @@ def main():
     logger.info(f"Processing {len(transcripts_to_process)} transcripts")
     logger.info(f"Output: {output_dir}")
     
+    # Tokenizer info
+    if args.tokenizer_name:
+        logger.info(f"Model: {args.model_name} (checkpoint: {args.checkpoint})")
+        logger.info(f"Tokenizer: {args.tokenizer_name} (separate)")
+    else:
+        logger.info(f"Model & Tokenizer: {args.model_name} (checkpoint: {args.checkpoint})")
+    
     # Save config
     output_dir.mkdir(parents=True, exist_ok=True)
     config = {
         "model_name": args.model_name,
+        "tokenizer_name": args.tokenizer_name,
         "checkpoint": args.checkpoint,
         "dtype": args.dtype,
         "layers": args.layers,
@@ -426,6 +593,8 @@ def main():
         "role_data_dir": str(role_data_dir),
         "num_gpus": args.num_gpus,
         "num_questions": len(questions),
+        "filtering_dir": str(filtering_dir) if filtering_dir else None,
+        "minimum_rating": args.minimum_rating,
     }
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -434,6 +603,7 @@ def main():
     
     if args.num_gpus == 1:
         from hf_utils import load_hf_model, get_num_layers
+        from transformers import AutoTokenizer
         
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -450,6 +620,16 @@ def main():
             torch_dtype=torch_dtype,
         )
         
+        # Override tokenizer if specified
+        if args.tokenizer_name:
+            logger.info(f"Loading separate tokenizer from {args.tokenizer_name}")
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.tokenizer_name,
+                trust_remote_code=True,
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        
         num_layers = get_num_layers(model)
         logger.info(f"Model has {num_layers} layers")
         
@@ -465,6 +645,19 @@ def main():
         for transcript_name in tqdm(transcripts_to_process, desc="Transcripts"):
             transcript_path = transcript_dir / f"{transcript_name}.jsonl"
             transcripts = load_transcripts(transcript_path)
+            
+            # Apply filtering if enabled
+            if filtering_dir and args.minimum_rating:
+                transcripts = filter_transcripts(
+                    transcripts=transcripts,
+                    filtering_dir=filtering_dir,
+                    transcript_name=transcript_name,
+                    minimum_rating=args.minimum_rating,
+                    worker_logger=logger,
+                )
+                if not transcripts:
+                    logger.warning(f"Skipping {transcript_name}: no samples after filtering")
+                    continue
             
             # Get system prompts
             if transcript_name == "default":
@@ -486,7 +679,10 @@ def main():
                 device=args.device,
             )
             
-            save_activations(output_dir, transcript_name, data)
+            if data["metadata"]:
+                save_activations(output_dir, transcript_name, data)
+            else:
+                logger.warning(f"No activations captured for {transcript_name}")
         
         logger.info("Done!")
     
@@ -510,7 +706,7 @@ def main():
                 p = mp.Process(
                     target=worker_fn,
                     args=(gpu_id, chunk, args, output_dir, transcript_dir, role_data_dir, 
-                          questions, default_prompts),
+                          questions, default_prompts, filtering_dir),
                 )
                 p.start()
                 processes.append((gpu_id, p))

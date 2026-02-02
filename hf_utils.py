@@ -54,15 +54,7 @@ def format_full_conversation(
 ) -> str:
     """
     Format a complete conversation including the assistant response.
-    
-    Args:
-        tokenizer: Tokenizer with chat template
-        system_prompt: System message content
-        user_message: User message content
-        assistant_response: Assistant's response
-        
-    Returns:
-        Formatted conversation string
+    Falls back to prepending system prompt if system role not supported.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -70,12 +62,27 @@ def format_full_conversation(
         {"role": "assistant", "content": assistant_response},
     ]
     
-    # Don't add generation prompt since we have the full response
-    formatted = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
+    try:
+        formatted = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception as e:
+        if "System role not supported" in str(e) or "system" in str(e).lower():
+            # Fallback: prepend system prompt to user message
+            combined_message = f"{system_prompt}\n\n{user_message}"
+            messages = [
+                {"role": "user", "content": combined_message},
+                {"role": "assistant", "content": assistant_response},
+            ]
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        else:
+            raise
     
     return formatted
 
@@ -88,22 +95,38 @@ def get_response_token_mask(
 ) -> tuple[torch.Tensor, int, int]:
     """
     Get token indices corresponding to the assistant response.
+    Falls back to prepending system prompt if system role not supported.
     
     Returns:
         Tuple of (full_input_ids, response_start_idx, response_end_idx)
     """
-    # Get the prompt without response
+    # Try with system message first
     prompt_messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
-    prompt_only = tokenizer.apply_chat_template(
-        prompt_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
     
-    # Get full conversation
+    use_fallback = False
+    try:
+        prompt_only = tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception as e:
+        if "System role not supported" in str(e) or "system" in str(e).lower():
+            use_fallback = True
+            combined_message = f"{system_prompt}\n\n{user_message}"
+            prompt_messages = [{"role": "user", "content": combined_message}]
+            prompt_only = tokenizer.apply_chat_template(
+                prompt_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            raise
+    
+    # Get full conversation (format_full_conversation handles fallback internally)
     full_conversation = format_full_conversation(
         tokenizer, system_prompt, user_message, assistant_response
     )
@@ -117,7 +140,7 @@ def get_response_token_mask(
     response_end = len(full_ids)
     
     return torch.tensor(full_ids), response_start, response_end
-
+    
 
 class ActivationCapture:
     """Context manager for capturing activations from model layers."""

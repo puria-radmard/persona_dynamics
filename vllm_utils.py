@@ -1,5 +1,6 @@
 """Utilities for vLLM model loading and generation."""
 
+import os
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 from typing import Optional
@@ -25,6 +26,7 @@ def load_model(
     Returns:
         Tuple of (LLM, tokenizer)
     """
+
     load_kwargs = {
         "model": model_name,
         "tensor_parallel_size": tensor_parallel_size,
@@ -37,7 +39,7 @@ def load_model(
     
     if max_model_len is not None:
         load_kwargs["max_model_len"] = max_model_len
-    
+
     llm = LLM(**load_kwargs)
     
     # Load tokenizer separately for chat template access
@@ -45,6 +47,7 @@ def load_model(
         model_name,
         revision=revision,
         trust_remote_code=True,
+        token = os.environ['HF_TOKEN']
     )
     
     return llm, tokenizer
@@ -57,26 +60,31 @@ def format_chat_prompt(
 ) -> str:
     """
     Format a prompt using the model's chat template.
-    
-    Args:
-        tokenizer: Tokenizer with chat template
-        system_prompt: System message content
-        user_message: User message content
-        
-    Returns:
-        Formatted prompt string
+    Falls back to prepending system prompt if system role not supported.
     """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
     
-    # add_generation_prompt=True adds the assistant turn prefix
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    try:
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception as e:
+        if "System role not supported" in str(e) or "system" in str(e).lower():
+            # Fallback: prepend system prompt to user message
+            combined_message = f"{system_prompt}\n\n{user_message}"
+            messages = [{"role": "user", "content": combined_message}]
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            raise
     
     return prompt
 

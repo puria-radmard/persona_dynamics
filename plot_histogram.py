@@ -388,7 +388,7 @@ def main():
     
     # --- Plotting ---
     
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(4, 1, figsize=(10, 20))
     axes = axes.flatten()
     
     group_colors = {
