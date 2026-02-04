@@ -1,12 +1,13 @@
-"""Plot PCA histograms of persona space, replicating main figure from Assistant Axis paper.
+"""Plot PCA analysis of persona space with cosine similarity histograms.
 
 Methodology:
 1. Load role activations (everything except 'default') and compute mean per role
 2. Load default activations and compute the "assistant" vector
 3. Fit PCA on role means only
-4. Project assistant vector into PCA space
-5. Compute Assistant Axis = assistant_vector - mean(all_role_vectors)
-6. Plot histograms with assistant marked
+4. Compute cosine similarity of each role/assistant to each PC direction
+5. Plot histograms of cosine similarities with assistant marked
+
+Saves to: <activations_dir>/analyses/assistant_axis.png and assistant_axis.json
 """
 
 import argparse
@@ -22,10 +23,13 @@ from sklearn.decomposition import PCA
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Role to always highlight in plots
+ALWAYS_HIGHLIGHT_ROLE = "robot"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot PCA histograms of persona activations"
+        description="Plot PCA analysis with cosine similarity histograms"
     )
     
     parser.add_argument(
@@ -33,12 +37,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Directory containing activation .pt files",
-    )
-    parser.add_argument(
-        "--output-path",
-        type=str,
-        default=None,
-        help="Output path for plot (default: activations_dir/pca_histogram.png)",
     )
     parser.add_argument(
         "--layer",
@@ -79,7 +77,6 @@ def load_activation_mean(path: Path, layer_idx: int):
         
         layer_acts = activations[layer_idx]
         
-        # Handle both aggregated (tensor) and non-aggregated (list) formats
         if isinstance(layer_acts, list):
             all_acts = torch.cat([a.mean(dim=0, keepdim=True) for a in layer_acts], dim=0)
             mean_act = all_acts.mean(dim=0)
@@ -94,12 +91,7 @@ def load_activation_mean(path: Path, layer_idx: int):
 
 
 def get_activation_files(activations_dir: Path) -> tuple[list[Path], Path | None]:
-    """
-    Separate activation files into role files and the default file.
-    
-    Returns:
-        (role_files, default_file)
-    """
+    """Separate activation files into role files and the default file."""
     role_files = []
     default_file = None
     
@@ -114,7 +106,7 @@ def get_activation_files(activations_dir: Path) -> tuple[list[Path], Path | None
 
 
 def load_filtering_results(filtering_dir: Path, role_name: str) -> list[dict] | None:
-    """Load filtering results for a role. Returns None if file doesn't exist."""
+    """Load filtering results for a role."""
     filtering_path = filtering_dir / f"{role_name}.jsonl"
     if not filtering_path.exists():
         return None
@@ -134,11 +126,9 @@ def get_passing_indices(
     passing = set()
     for r in filtering_results:
         try:
-            # Parse judge response - might be "3" or "3\n" or have extra text
             response = r.get("judge_response", "")
             if response is None:
                 continue
-            # Extract first digit found
             rating = None
             for char in response.strip():
                 if char.isdigit():
@@ -159,12 +149,7 @@ def load_activation_mean_filtered(
     layer_idx: int,
     passing_indices: set[tuple[int, int, int]] | None,
 ) -> tuple[torch.Tensor | None, int, int]:
-    """
-    Load activations and compute mean, optionally filtering by passing indices.
-    
-    Returns:
-        (mean_activation, num_kept, num_total)
-    """
+    """Load activations and compute mean, optionally filtering."""
     try:
         activations = torch.load(activations_path, map_location="cpu")
         
@@ -173,14 +158,12 @@ def load_activation_mean_filtered(
         
         layer_acts = activations[layer_idx]
         
-        # Load metadata to map indices
         with open(metadata_path) as f:
             metadata = json.load(f)
         
         num_total = len(metadata)
         
         if passing_indices is None:
-            # No filtering - use all
             if isinstance(layer_acts, list):
                 all_acts = torch.cat([a.mean(dim=0, keepdim=True) for a in layer_acts], dim=0)
                 mean_act = all_acts.mean(dim=0)
@@ -188,7 +171,6 @@ def load_activation_mean_filtered(
                 mean_act = layer_acts.mean(dim=0)
             return mean_act.float(), num_total, num_total
         
-        # Filter based on passing indices
         kept_acts = []
         for i, meta in enumerate(metadata):
             key = (meta["system_prompt_idx"], meta["question_idx"], meta["rollout_idx"])
@@ -213,46 +195,69 @@ def load_activation_mean_filtered(
         return None, 0, 0
 
 
+def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors."""
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (norm1 * norm2))
+
+
 def select_highlighted_roles(
-    role_projections: dict[str, float],
+    role_cosines: dict[str, float],
     n_per_group: int = 3,
     seed: int = 42,
+    always_include: str | None = ALWAYS_HIGHLIGHT_ROLE,
 ) -> list[tuple[str, float, str]]:
-    """
-    Select roles to highlight: 3 from top, 3 from middle, 3 from bottom.
-    
-    Returns list of (role_name, projection_value, group) tuples.
-    """
+    """Select roles to highlight: 3 from top, 3 from middle, 3 from bottom, plus always_include."""
     np.random.seed(seed)
     
-    sorted_roles = sorted(role_projections.items(), key=lambda x: x[1], reverse=True)
+    sorted_roles = sorted(role_cosines.items(), key=lambda x: x[1], reverse=True)
     n_roles = len(sorted_roles)
+    
+    selected = []
+    selected_names = set()
+    
+    # Always include the specified role if it exists
+    if always_include and always_include in role_cosines:
+        selected.append((always_include, role_cosines[always_include], 'always'))
+        selected_names.add(always_include)
     
     if n_roles < 30:
         step = max(1, n_roles // 9)
         indices = list(range(0, n_roles, step))[:9]
-        return [(sorted_roles[i][0], sorted_roles[i][1], 'selected') for i in indices]
+        for i in indices:
+            name, val = sorted_roles[i]
+            if name not in selected_names:
+                selected.append((name, val, 'selected'))
+                selected_names.add(name)
+        return selected
     
-    selected = []
-    
-    # Top 10 (most positive)
-    top_10 = sorted_roles[:10]
-    top_idx = np.random.choice(len(top_10), size=min(n_per_group, len(top_10)), replace=False)
-    for i in top_idx:
-        selected.append((top_10[i][0], top_10[i][1], 'positive'))
+    # Top 10 (most positive cosine)
+    top_10 = [(name, val) for name, val in sorted_roles[:10] if name not in selected_names]
+    if top_10:
+        top_idx = np.random.choice(len(top_10), size=min(n_per_group, len(top_10)), replace=False)
+        for i in top_idx:
+            selected.append((top_10[i][0], top_10[i][1], 'positive'))
+            selected_names.add(top_10[i][0])
     
     # Middle 10
     mid_start = n_roles // 2 - 5
-    middle_10 = sorted_roles[mid_start:mid_start + 10]
-    mid_idx = np.random.choice(len(middle_10), size=min(n_per_group, len(middle_10)), replace=False)
-    for i in mid_idx:
-        selected.append((middle_10[i][0], middle_10[i][1], 'middle'))
+    middle_10 = [(name, val) for name, val in sorted_roles[mid_start:mid_start + 10] if name not in selected_names]
+    if middle_10:
+        mid_idx = np.random.choice(len(middle_10), size=min(n_per_group, len(middle_10)), replace=False)
+        for i in mid_idx:
+            selected.append((middle_10[i][0], middle_10[i][1], 'middle'))
+            selected_names.add(middle_10[i][0])
     
-    # Bottom 10 (most negative)
-    bottom_10 = sorted_roles[-10:]
-    bot_idx = np.random.choice(len(bottom_10), size=min(n_per_group, len(bottom_10)), replace=False)
-    for i in bot_idx:
-        selected.append((bottom_10[i][0], bottom_10[i][1], 'negative'))
+    # Bottom 10 (most negative cosine)
+    bottom_10 = [(name, val) for name, val in sorted_roles[-10:] if name not in selected_names]
+    if bottom_10:
+        bot_idx = np.random.choice(len(bottom_10), size=min(n_per_group, len(bottom_10)), replace=False)
+        for i in bot_idx:
+            selected.append((bottom_10[i][0], bottom_10[i][1], 'negative'))
+            selected_names.add(bottom_10[i][0])
     
     return selected
 
@@ -264,14 +269,14 @@ def main():
     if not activations_dir.exists():
         raise FileNotFoundError(f"Activations directory not found: {activations_dir}")
     
-    # Setup filtering if provided
+    # Setup output directory
+    output_dir = activations_dir / "analyses"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup filtering
     filtering_dir = Path(args.filtering_dir) if args.filtering_dir else None
     if filtering_dir and not filtering_dir.exists():
         raise FileNotFoundError(f"Filtering directory not found: {filtering_dir}")
-    
-    if filtering_dir:
-        logger.info(f"Filtering enabled: {filtering_dir}")
-        logger.info(f"Minimum rating: {args.minimum_rating}")
     
     # Separate role and default files
     role_files, default_file = get_activation_files(activations_dir)
@@ -280,26 +285,17 @@ def main():
     if len(role_files) == 0:
         raise ValueError("No role activation files found")
     if default_file is None:
-        raise ValueError("No default activation file found (need default_activations.pt)")
+        raise ValueError("No default activation file found")
     
-    logger.info(f"Default file: {default_file}")
-    
-    # Determine layer to use
+    # Determine layer
     sample_acts = torch.load(role_files[0], map_location="cpu")
     available_layers = list(sample_acts.keys())
-    
-    if args.layer is not None:
-        if args.layer not in available_layers:
-            raise ValueError(f"Layer {args.layer} not available. Available: {available_layers}")
-        layer_idx = args.layer
-    else:
-        layer_idx = available_layers[0]
-    
+    layer_idx = args.layer if args.layer is not None else available_layers[0]
     logger.info(f"Using layer {layer_idx}")
     
-    # Load role means (with optional filtering)
+    # Load role means
     role_means = {}
-    role_counts = {}  # Track (kept, total) for each role
+    role_counts = {}
     roles_missing_filtering = []
     roles_no_passing = []
     
@@ -307,17 +303,16 @@ def main():
         name = f.stem.replace("_activations", "")
         metadata_path = f.parent / f"{name}_metadata.json"
         
-        # Get filtering info if enabled
         passing_indices = None
         if filtering_dir:
             filtering_results = load_filtering_results(filtering_dir, name)
             if filtering_results is None:
                 roles_missing_filtering.append(name)
-                continue  # Skip this role - no filtering info
+                continue
             passing_indices = get_passing_indices(filtering_results, args.minimum_rating)
             if len(passing_indices) == 0:
                 roles_no_passing.append(name)
-                continue  # Skip - no samples pass the filter
+                continue
         
         mean_act, num_kept, num_total = load_activation_mean_filtered(
             f, metadata_path, layer_idx, passing_indices
@@ -327,123 +322,126 @@ def main():
             role_means[name] = mean_act.numpy()
             role_counts[name] = (num_kept, num_total)
     
-    # Report filtering results
-    if filtering_dir:
-        if roles_missing_filtering:
-            print(f"\n⚠️  Roles skipped (no filtering data yet): {len(roles_missing_filtering)}")
-            if len(roles_missing_filtering) <= 20:
-                print(f"   {', '.join(sorted(roles_missing_filtering))}")
-            else:
-                print(f"   {', '.join(sorted(roles_missing_filtering)[:10])}, ... and {len(roles_missing_filtering) - 10} more")
-        
-        if roles_no_passing:
-            print(f"\n⚠️  Roles skipped (no samples with rating >= {args.minimum_rating}): {len(roles_no_passing)}")
-            if len(roles_no_passing) <= 20:
-                print(f"   {', '.join(sorted(roles_no_passing))}")
-        
-        # Summary stats
-        total_kept = sum(c[0] for c in role_counts.values())
-        total_samples = sum(c[1] for c in role_counts.values())
-        print(f"\n✓ Loaded {len(role_means)} roles with filtering")
-        print(f"  Samples kept: {total_kept:,} / {total_samples:,} ({100*total_kept/total_samples:.1f}%)")
-    else:
-        logger.info(f"Loaded {len(role_means)} role means (no filtering)")
+    logger.info(f"Loaded {len(role_means)} role means")
     
     if len(role_means) == 0:
-        raise ValueError("No roles loaded! Check filtering settings or wait for more batch results.")
+        raise ValueError("No roles loaded!")
     
-    # Load default (assistant) vector - no filtering applied
+    # Load assistant vector
     assistant_vector = load_activation_mean(default_file, layer_idx)
     if assistant_vector is None:
         raise ValueError("Failed to load default activations")
     assistant_vector = assistant_vector.numpy()
-    logger.info("Loaded assistant vector from default file")
+    logger.info("Loaded assistant vector")
     
     # Stack role means for PCA
     roles = list(role_means.keys())
-    X = np.stack([role_means[r] for r in roles], axis=0)  # (n_roles, hidden_dim)
+    X = np.stack([role_means[r] for r in roles], axis=0)
     
     logger.info(f"Running PCA on {X.shape[0]} roles, {X.shape[1]} dimensions")
     
-    # Fit PCA on roles only (NOT including assistant)
+    # Fit PCA on roles (NOT including assistant)
+    # Center on role mean
+    role_mean = X.mean(axis=0)
+    X_centered = X - role_mean
+    assistant_centered = assistant_vector - role_mean
+    
     n_components = min(X.shape[0], X.shape[1]) - 1
-    pca = PCA(n_components=n_components, whiten=True)
-    role_projections = pca.fit_transform(X)  # (n_roles, n_components)
+    pca = PCA(n_components=n_components, whiten=False)  # Don't whiten to preserve direction
+    pca.fit(X_centered)
     
     logger.info(f"Computed {pca.n_components_} principal components")
     
-    # Project assistant vector into PCA space
-    assistant_projection = pca.transform(assistant_vector.reshape(1, -1))[0]
+    # PCs are unit vectors (sklearn normalizes them)
+    # Compute cosine similarity of each centered role vector to each PC
+    # cos(role, PC_i) = (role · PC_i) / ||role||
     
-    # Compute Assistant Axis: assistant - mean(roles)
-    role_mean = X.mean(axis=0)
-    assistant_axis = assistant_vector - role_mean
+    role_cosines = {}  # {role: {PC1: cos, PC2: cos, ...}}
+    for i, role in enumerate(roles):
+        role_vec = X_centered[i]
+        role_norm = np.linalg.norm(role_vec)
+        role_cosines[role] = {}
+        for pc_idx in range(pca.n_components_):
+            pc_vec = pca.components_[pc_idx]
+            cos_sim = np.dot(role_vec, pc_vec) / role_norm if role_norm > 0 else 0
+            role_cosines[role][f"PC{pc_idx+1}"] = float(cos_sim)
+    
+    # Compute cosine similarity of assistant to each PC
+    assistant_norm = np.linalg.norm(assistant_centered)
+    assistant_cosines = {}
+    for pc_idx in range(pca.n_components_):
+        pc_vec = pca.components_[pc_idx]
+        cos_sim = np.dot(assistant_centered, pc_vec) / assistant_norm if assistant_norm > 0 else 0
+        assistant_cosines[f"PC{pc_idx+1}"] = float(cos_sim)
+    
+    # Compute Assistant Axis = assistant_centered / ||assistant_centered||
+    assistant_axis = assistant_centered / assistant_norm if assistant_norm > 0 else assistant_centered
     
     # Cosine similarity between Assistant Axis and PC1
-    assistant_axis_norm = assistant_axis / np.linalg.norm(assistant_axis)
-    pc1_norm = pca.components_[0] / np.linalg.norm(pca.components_[0])
-    axis_pc1_cosine = float(np.dot(assistant_axis_norm, pc1_norm))
+    pc1_norm = np.linalg.norm(pca.components_[0])
+    axis_pc1_cosine = float(np.dot(assistant_axis, pca.components_[0]) / pc1_norm)
     
     logger.info(f"Assistant Axis ↔ PC1 cosine similarity: {axis_pc1_cosine:.3f}")
     
     # --- Plotting ---
     
     fig, axes = plt.subplots(4, 1, figsize=(10, 20))
-    axes = axes.flatten()
     
     group_colors = {
         'positive': '#2ecc71',
         'middle': '#3498db',
         'negative': '#e74c3c',
         'selected': '#95a5a6',
+        'always': '#9b59b6',  # Purple for always-highlighted role (robot)
     }
     
-    role_to_idx = {r: i for i, r in enumerate(roles)}
-    
-    # Plot top 3 PCs
-    for pc_idx in range(min(3, role_projections.shape[1])):
+    # Plot top 3 PCs - now showing COSINE SIMILARITY
+    for pc_idx in range(min(3, pca.n_components_)):
         ax = axes[pc_idx]
+        pc_name = f"PC{pc_idx+1}"
         
-        pc_values = role_projections[:, pc_idx]
-        assistant_pc = assistant_projection[pc_idx]
+        # Get cosine similarities for all roles to this PC
+        cosine_values = np.array([role_cosines[r][pc_name] for r in roles])
+        assistant_cos = assistant_cosines[pc_name]
         
-        # Histogram of role projections
-        ax.hist(pc_values, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
+        # Histogram of role cosine similarities
+        ax.hist(cosine_values, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
         
         # Mark assistant with star
-        ax.axvline(assistant_pc, color='gold', linewidth=2, linestyle='--', alpha=0.8)
-        ax.scatter([assistant_pc], [0], marker='*', s=300, color='gold',
+        ax.axvline(assistant_cos, color='gold', linewidth=2, linestyle='--', alpha=0.8)
+        ax.scatter([assistant_cos], [0], marker='*', s=300, color='gold',
                   edgecolor='black', linewidth=1, zorder=10, label='Assistant')
         
         # Select and mark other roles
-        role_pc_values = {r: role_projections[role_to_idx[r], pc_idx] for r in roles}
-        highlighted = select_highlighted_roles(role_pc_values, seed=args.seed + pc_idx)
+        role_pc_cosines = {r: role_cosines[r][pc_name] for r in roles}
+        highlighted = select_highlighted_roles(role_pc_cosines, seed=args.seed + pc_idx)
         
-        for role_name, proj_val, group in highlighted:
+        for role_name, cos_val, group in highlighted:
             color = group_colors.get(group, 'black')
-            ax.scatter([proj_val], [0], marker='o', s=80, color=color,
+            # Make 'always' role (robot) more prominent
+            marker_size = 120 if group == 'always' else 80
+            marker = 'D' if group == 'always' else 'o'  # Diamond for robot
+            ax.scatter([cos_val], [0], marker=marker, s=marker_size, color=color,
                       edgecolor='black', linewidth=0.5, zorder=5)
-            ax.annotate(role_name, (proj_val, 0), textcoords="offset points",
-                       xytext=(0, -15), ha='center', fontsize=7, rotation=45)
+            ax.annotate(role_name, (cos_val, 0), textcoords="offset points",
+                       xytext=(0, -15), ha='center', fontsize=7, rotation=45,
+                       fontweight='bold' if group == 'always' else 'normal')
         
         variance_pct = pca.explained_variance_ratio_[pc_idx] * 100
-        ax.set_xlabel(f'PC{pc_idx + 1} projection')
+        ax.set_xlabel(f'Cosine similarity to {pc_name}')
         ax.set_ylabel('Count')
-        ax.set_title(f'PC{pc_idx + 1} ({variance_pct:.1f}% variance)')
+        ax.set_title(f'{pc_name} ({variance_pct:.1f}% variance) - Cosine Similarity Distribution')
+        ax.set_xlim(-1, 1)
         ax.axhline(0, color='black', linewidth=0.5)
+        ax.axvline(0, color='gray', linewidth=0.5, linestyle=':')
         
         if pc_idx == 0:
             ax.legend(loc='upper right')
     
-    # Cumulative variance explained + Assistant squared contribution per PC
+    # Bottom plot: Cumulative variance + Assistant ABSOLUTE cosine similarity per PC
     ax = axes[3]
     
-    # Compute squared contribution for each PC: (a_i / ||a||)^2
-    # This measures: what fraction of the assistant's squared distance from role centroid is along PC i?
-    # These sum to 1 across all PCs (Pythagorean theorem)
-    n_pcs_to_show = min(50, role_projections.shape[1])
-    assistant_norm = np.linalg.norm(assistant_projection)
-    squared_contributions = (assistant_projection[:n_pcs_to_show] / assistant_norm) ** 2
+    n_pcs_to_show = pca.n_components_  # Show ALL PCs
     
     # Plot cumulative variance (left axis)
     cumvar = np.cumsum(pca.explained_variance_ratio_) * 100
@@ -457,47 +455,49 @@ def main():
     ax.set_ylim(0, 100)
     ax.grid(True, alpha=0.3)
     
-    # Plot squared contribution on secondary y-axis
+    # Plot assistant ABSOLUTE cosine similarity on secondary y-axis
     ax2 = ax.twinx()
-    ax2.plot(range(1, n_pcs_to_show + 1), squared_contributions * 100, 's-', color='coral',
-             linewidth=2, markersize=4, label='Assistant (aᵢ/||a||)²')
-    ax2.set_ylabel('Assistant squared contribution (%)', color='coral')
+    assistant_cos_values = [
+        np.dot(assistant_centered, pca.components_[i]) / assistant_norm
+        for i in range(n_pcs_to_show)
+    ]
+    assistant_abs_cos_values = [abs(c) for c in assistant_cos_values]
+    ax2.plot(range(1, n_pcs_to_show + 1), assistant_abs_cos_values, 's-', color='coral',
+             linewidth=2, markersize=4, label='Assistant |cos(a, PCᵢ)|')
+    ax2.set_ylabel('Assistant |cosine similarity| to PC', color='coral')
     ax2.tick_params(axis='y', labelcolor='coral')
-    ax2.set_ylim(0, min(100, max(squared_contributions) * 120))  # Scale to show variation
+    ax2.set_ylim(0, 1)
     
     # Combined legend
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines1 + lines2, labels1 + labels2, loc='center right', fontsize=8)
     
-    ax.set_title(f'Variance & Assistant Contribution (Axis↔PC1: {axis_pc1_cosine:.2f})')
+    ax.set_title(f'Variance & Assistant-PC Cosine Similarity (Axis↔PC1: {axis_pc1_cosine:.2f})')
     
-    # Add figure title with filtering info
+    # Figure title
     if filtering_dir:
         total_kept = sum(c[0] for c in role_counts.values())
         total_samples = sum(c[1] for c in role_counts.values())
-        suptitle = f"PCA of {len(roles)} roles (filtered: rating ≥ {args.minimum_rating}, {total_kept:,}/{total_samples:,} samples)"
+        suptitle = f"Assistant Axis Analysis: {len(roles)} roles (filtered: rating ≥ {args.minimum_rating}, {total_kept:,}/{total_samples:,} samples)"
     else:
-        suptitle = f"PCA of {len(roles)} roles (unfiltered)"
+        suptitle = f"Assistant Axis Analysis: {len(roles)} roles (unfiltered)"
     fig.suptitle(suptitle, fontsize=14, fontweight='bold', y=1.02)
     
     plt.tight_layout()
     
     # Save plot
-    if args.output_path:
-        output_path = Path(args.output_path)
-    else:
-        output_path = activations_dir / "pca_histogram.png"
-    
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "assistant_axis.png"
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     logger.info(f"Saved plot to {output_path}")
     
-    # Compute squared contributions for results
-    assistant_norm_for_results = np.linalg.norm(assistant_projection)
-    squared_contribs_for_results = (assistant_projection / assistant_norm_for_results) ** 2
+    # --- Save results JSON ---
     
-    # Save results JSON
+    # Add robot-specific data if available
+    robot_cosines = None
+    if ALWAYS_HIGHLIGHT_ROLE in role_cosines:
+        robot_cosines = role_cosines[ALWAYS_HIGHLIGHT_ROLE]
+    
     results = {
         "layer": layer_idx,
         "n_roles": len(role_means),
@@ -513,35 +513,33 @@ def main():
         "explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
         "cumulative_variance": np.cumsum(pca.explained_variance_ratio_).tolist(),
         "assistant_axis_pc1_cosine": axis_pc1_cosine,
-        "assistant_norm": float(assistant_norm_for_results),
+        "assistant_norm": float(assistant_norm),
         "roles": roles,
         "role_sample_counts": {r: {"kept": c[0], "total": c[1]} for r, c in role_counts.items()} if role_counts else {},
-        "assistant_projections": {
-            f"PC{i+1}": float(assistant_projection[i]) 
-            for i in range(min(10, len(assistant_projection)))
+        "assistant_cosine_to_pcs": assistant_cosines,  # All PCs
+        "assistant_abs_cosine_to_pcs": {
+            f"PC{i+1}": abs(assistant_cosines[f"PC{i+1}"]) 
+            for i in range(pca.n_components_)
         },
+        "robot_cosine_to_pcs": robot_cosines,  # Robot role cosines (or None if not present)
         "assistant_percentile": {
-            f"PC{i+1}": float((role_projections[:, i] < assistant_projection[i]).mean() * 100)
-            for i in range(min(10, len(assistant_projection)))
+            pc_name: float((np.array([role_cosines[r][pc_name] for r in roles]) < assistant_cosines[pc_name]).mean() * 100)
+            for pc_name in assistant_cosines.keys()
         },
-        "assistant_squared_contribution": {
-            f"PC{i+1}": float(squared_contribs_for_results[i] * 100)
-            for i in range(min(10, len(assistant_projection)))
-        },
-        "role_projections": {
-            f"PC{i+1}": {r: float(role_projections[role_to_idx[r], i]) for r in roles}
-            for i in range(min(3, role_projections.shape[1]))
+        "role_cosines_to_pcs": {
+            pc_name: {r: role_cosines[r][pc_name] for r in roles}
+            for pc_name in [f"PC{i+1}" for i in range(pca.n_components_)]
         },
     }
     
-    results_path = output_path.with_suffix('.json')
+    results_path = output_dir / "assistant_axis.json"
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     logger.info(f"Saved results to {results_path}")
     
     # Print summary
     print("\n" + "=" * 60)
-    print("PCA Summary")
+    print("Assistant Axis Analysis Summary")
     print("=" * 60)
     print(f"Roles: {len(role_means)}")
     print(f"Layer: {layer_idx}")
@@ -551,31 +549,26 @@ def main():
         total_samples = sum(c[1] for c in role_counts.values())
         print(f"\nFiltering: rating ≥ {args.minimum_rating}")
         print(f"  Samples: {total_kept:,} / {total_samples:,} ({100*total_kept/total_samples:.1f}% kept)")
-        if roles_missing_filtering:
-            print(f"  Roles skipped (no filtering data): {len(roles_missing_filtering)}")
     
     print(f"\nAssistant Axis ↔ PC1 cosine similarity: {axis_pc1_cosine:.3f}")
     print(f"  (Paper reports >0.71 at middle layer)")
+    
     print(f"\nVariance explained:")
     for i in range(min(5, len(pca.explained_variance_ratio_))):
         print(f"  PC{i+1}: {pca.explained_variance_ratio_[i]*100:.1f}%")
     
-    # Compute squared contributions for summary
-    assistant_norm = np.linalg.norm(assistant_projection)
-    squared_contribs = (assistant_projection / assistant_norm) ** 2
+    print(f"\nAssistant cosine similarity to PCs:")
+    print(f"  ||a|| = {assistant_norm:.3f} (centered distance from role mean)")
+    for i in range(min(10, pca.n_components_)):
+        pc_name = f"PC{i+1}"
+        cos_val = assistant_cosines[pc_name]
+        abs_cos_val = abs(cos_val)
+        all_cosines = np.array([role_cosines[r][pc_name] for r in roles])
+        percentile = (all_cosines < cos_val).mean() * 100
+        print(f"  {pc_name}: {cos_val:+.3f} (|cos|={abs_cos_val:.3f}, percentile: {percentile:.1f}%)")
     
-    print(f"\nAssistant position (projection a onto PCs, centered at role mean):")
-    print(f"  ||a|| = {assistant_norm:.3f}")
-    print(f"  (aᵢ/||a||)² sums to 1 across all PCs")
-    for i in range(min(5, len(assistant_projection))):
-        pc_values = role_projections[:, i]
-        assistant_pc = assistant_projection[i]
-        prop_below = (pc_values < assistant_pc).mean()
-        sq_contrib = squared_contribs[i]
-        print(f"  PC{i+1}: {assistant_pc:+.3f}  (percentile: {prop_below*100:.1f}%, contribution: {sq_contrib*100:.1f}%)")
-    
-    print(f"\nCumulative contribution (first 5 PCs): {squared_contribs[:5].sum()*100:.1f}%")
-    print(f"  (If Assistant Axis ≈ PC1, expect PC1 to dominate)")
+    if pca.n_components_ > 10:
+        print(f"  ... ({pca.n_components_ - 10} more PCs in JSON)")
 
 
 if __name__ == "__main__":

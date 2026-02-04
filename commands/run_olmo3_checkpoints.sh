@@ -1,22 +1,26 @@
 #!/bin/bash
-# Run activation capture for OLMo-3 base model checkpoints
+# Run activation capture for Olmo-3 base model checkpoints
 # Using transcripts from the instruct model
 
 TRANSCRIPT_DIR="outputs/transcripts/upgrade/allenai_Olmo-3.1-32B-Instruct/main"
-BASE_MODEL="allenai/OLMo-3-1125-32B"
-TOKENIZER="allenai/OLMo-3.1-32B-Instruct"
-NUM_GPUS=2
-BATCH_SIZE=16  # Adjust based on VRAM - start with 16, try 32 if no OOM
+BASE_MODEL="allenai/Olmo-3-1125-32B"
+TOKENIZER="allenai/Olmo-3.1-32B-Instruct"
+NUM_GPUS=1
+BATCH_SIZE=32  # Adjust based on VRAM - start with 16, try 32 if no OOM
 
 # List of checkpoints to process
 CHECKPOINTS=(
-    "stage1-step337000"
-    "stage1-step499000"
-    "stage1-step656000"
-    "stage2-ingredient1-step0"
-    "stage2-ingredient1-step7000"
-    "stage2-ingredient1-step14000"
-    "stage2-ingredient1-step21000"
+    "stage1-step1000"
+    "stage1-step0"
+    "stage1-step2000"
+    "stage1-step10000"
+    # "stage1-step100000"
+    # "stage1-step50000"
+    # "stage1-step168000"
+    # "stage1-step337000"
+    # "stage1-step499000"
+    # "stage3-step1000"
+    "main"
 )
 
 # Run each checkpoint

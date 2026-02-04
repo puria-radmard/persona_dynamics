@@ -139,6 +139,13 @@ def parse_args() -> argparse.Namespace:
         help="Minimum judge rating to include. Requires filtering results to exist. "
              "Roles without filtering data will be SKIPPED (use --resume to fill in later).",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for activation extraction. Higher values use more VRAM but are faster. "
+             "Start with 8-16 and increase until you hit OOM.",
+    )
     
     return parser.parse_args()
 
@@ -283,7 +290,13 @@ def filter_transcripts(
     Returns:
         (filtered_transcripts, status_message)
         filtered_transcripts is None if role should be skipped (no filtering data)
+    
+    Note: 'default' transcripts are never filtered (needed for assistant vector).
     """
+    # Never filter default - it's needed unfiltered for the assistant vector
+    if transcript_name == "default":
+        return transcripts, f"all {len(transcripts)} samples (default, no filtering)"
+    
     filtering_results = load_filtering_results(filtering_dir, transcript_name)
     
     if filtering_results is None:
@@ -314,57 +327,156 @@ def process_transcript(
     layer_indices: list[int],
     aggregation: str,
     device: str,
+    batch_size: int = 1,
 ) -> dict:
     """
     Process all transcripts and extract activations.
     
+    Args:
+        batch_size: Number of samples to process in parallel. Higher = more VRAM usage.
+    
     Returns:
         Dict with 'activations' and 'metadata'
     """
-    from hf_utils import extract_response_activations
+    from hf_utils import extract_response_activations, extract_response_activations_batched
     
     layer_activations = {layer_idx: [] for layer_idx in layer_indices}
     metadata = []
     
-    for transcript in tqdm(transcripts, desc=f"  {transcript_name}", leave=False):
-        sp_idx = transcript["system_prompt_idx"]
-        q_idx = transcript["question_idx"]
-        r_idx = transcript["rollout_idx"]
-        response = transcript["response"]
-        
-        system_prompt = system_prompts[sp_idx]
-        question = questions[q_idx]
-        
-        try:
-            activations = extract_response_activations(
-                model=model,
-                tokenizer=tokenizer,
-                system_prompt=system_prompt,
-                user_message=question,
-                assistant_response=response,
-                layer_indices=layer_indices,
-                device=device,
-            )
-        except Exception as e:
-            logger.warning(f"  Failed for {transcript_name} "
-                          f"(sp={sp_idx}, q={q_idx}, r={r_idx}): {e}")
-            continue
-        
-        for layer_idx, acts in activations.items():
-            if aggregation == "mean":
-                aggregated = acts.mean(dim=0)
-            elif aggregation == "last":
-                aggregated = acts[-1]
-            else:
-                aggregated = acts
+    if batch_size == 1:
+        # Original single-sample processing
+        for transcript in tqdm(transcripts, desc=f"  {transcript_name}", leave=False):
+            sp_idx = transcript["system_prompt_idx"]
+            q_idx = transcript["question_idx"]
+            r_idx = transcript["rollout_idx"]
+            response = transcript["response"]
             
-            layer_activations[layer_idx].append(aggregated)
+            system_prompt = system_prompts[sp_idx]
+            question = questions[q_idx]
+            
+            try:
+                activations = extract_response_activations(
+                    model=model,
+                    tokenizer=tokenizer,
+                    system_prompt=system_prompt,
+                    user_message=question,
+                    assistant_response=response,
+                    layer_indices=layer_indices,
+                    device=device,
+                )
+            except Exception as e:
+                logger.warning(f"  Failed for {transcript_name} "
+                              f"(sp={sp_idx}, q={q_idx}, r={r_idx}): {e}")
+                continue
+            
+            for layer_idx, acts in activations.items():
+                if aggregation == "mean":
+                    aggregated = acts.mean(dim=0)
+                elif aggregation == "last":
+                    aggregated = acts[-1]
+                else:
+                    aggregated = acts
+                
+                layer_activations[layer_idx].append(aggregated)
+            
+            metadata.append({
+                "system_prompt_idx": sp_idx,
+                "question_idx": q_idx,
+                "rollout_idx": r_idx,
+            })
+    else:
+        # Batched processing
+        num_batches = (len(transcripts) + batch_size - 1) // batch_size
         
-        metadata.append({
-            "system_prompt_idx": sp_idx,
-            "question_idx": q_idx,
-            "rollout_idx": r_idx,
-        })
+        for batch_start in tqdm(range(0, len(transcripts), batch_size), 
+                                desc=f"  {transcript_name}", 
+                                total=num_batches,
+                                leave=False):
+            batch = transcripts[batch_start:batch_start + batch_size]
+            
+            # Prepare batch inputs
+            batch_system_prompts = []
+            batch_user_messages = []
+            batch_responses = []
+            batch_metadata = []
+            
+            for transcript in batch:
+                sp_idx = transcript["system_prompt_idx"]
+                q_idx = transcript["question_idx"]
+                r_idx = transcript["rollout_idx"]
+                
+                batch_system_prompts.append(system_prompts[sp_idx])
+                batch_user_messages.append(questions[q_idx])
+                batch_responses.append(transcript["response"])
+                batch_metadata.append({
+                    "system_prompt_idx": sp_idx,
+                    "question_idx": q_idx,
+                    "rollout_idx": r_idx,
+                })
+            
+            try:
+                # Batched extraction
+                batch_activations = extract_response_activations_batched(
+                    model=model,
+                    tokenizer=tokenizer,
+                    system_prompts=batch_system_prompts,
+                    user_messages=batch_user_messages,
+                    assistant_responses=batch_responses,
+                    layer_indices=layer_indices,
+                    device=device,
+                )
+                
+                # Process each item in batch
+                for i, item_activations in enumerate(batch_activations):
+                    if item_activations is None:
+                        # This item failed
+                        continue
+                    
+                    for layer_idx, acts in item_activations.items():
+                        if aggregation == "mean":
+                            aggregated = acts.mean(dim=0)
+                        elif aggregation == "last":
+                            aggregated = acts[-1]
+                        else:
+                            aggregated = acts
+                        
+                        layer_activations[layer_idx].append(aggregated)
+                    
+                    metadata.append(batch_metadata[i])
+                    
+            except Exception as e:
+                logger.warning(f"  Batch failed for {transcript_name}, falling back to single: {e}")
+                # Fallback to single-sample processing for this batch
+                for i, transcript in enumerate(batch):
+                    sp_idx = transcript["system_prompt_idx"]
+                    q_idx = transcript["question_idx"]
+                    r_idx = transcript["rollout_idx"]
+                    
+                    try:
+                        activations = extract_response_activations(
+                            model=model,
+                            tokenizer=tokenizer,
+                            system_prompt=system_prompts[sp_idx],
+                            user_message=questions[q_idx],
+                            assistant_response=transcript["response"],
+                            layer_indices=layer_indices,
+                            device=device,
+                        )
+                    except Exception as e2:
+                        logger.warning(f"    Failed single (sp={sp_idx}, q={q_idx}, r={r_idx}): {e2}")
+                        continue
+                    
+                    for layer_idx, acts in activations.items():
+                        if aggregation == "mean":
+                            aggregated = acts.mean(dim=0)
+                        elif aggregation == "last":
+                            aggregated = acts[-1]
+                        else:
+                            aggregated = acts
+                        
+                        layer_activations[layer_idx].append(aggregated)
+                    
+                    metadata.append(batch_metadata[i])
     
     # Stack if aggregated
     result_activations = {}
@@ -501,6 +613,7 @@ def worker_fn(
             layer_indices=layer_indices,
             aggregation=args.aggregation,
             device="cuda",
+            batch_size=args.batch_size,
         )
         
         if data["metadata"]:  # Only save if we have data
@@ -591,10 +704,10 @@ def main():
     # Preview filtering impact
     if filtering_dir and args.minimum_rating:
         roles_with_filtering = get_roles_with_filtering(filtering_dir)
-        will_process = [t for t in transcripts_to_process if t in roles_with_filtering]
-        will_skip = [t for t in transcripts_to_process if t not in roles_with_filtering]
+        will_process = [t for t in transcripts_to_process if t in roles_with_filtering or t == "default"]
+        will_skip = [t for t in transcripts_to_process if t not in roles_with_filtering and t != "default"]
         logger.info(f"With current filtering data:")
-        logger.info(f"  Will process: {len(will_process)} roles")
+        logger.info(f"  Will process: {len(will_process)} roles (includes 'default' if present)")
         logger.info(f"  Will skip (no filtering data yet): {len(will_skip)} roles")
         if will_skip and len(will_skip) <= 10:
             logger.info(f"    Skipped roles: {', '.join(sorted(will_skip))}")
@@ -608,6 +721,9 @@ def main():
         logger.info(f"Tokenizer: {args.tokenizer_name} (separate)")
     else:
         logger.info(f"Model & Tokenizer: {args.model_name} (checkpoint: {args.checkpoint})")
+    
+    if args.batch_size > 1:
+        logger.info(f"Batch size: {args.batch_size} (increase if VRAM available, decrease if OOM)")
     
     # Save config
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +742,7 @@ def main():
         "num_questions": len(questions),
         "filtering_dir": str(filtering_dir) if filtering_dir else None,
         "minimum_rating": args.minimum_rating,
+        "batch_size": args.batch_size,
     }
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -719,6 +836,7 @@ def main():
                 layer_indices=layer_indices,
                 aggregation=args.aggregation,
                 device=args.device,
+                batch_size=args.batch_size,
             )
             
             if data["metadata"]:

@@ -41,7 +41,6 @@ def parse_args() -> argparse.Namespace:
         "--model-name",
         type=str,
         required=True,
-        # default="allenai/OLMo-2-7B-Instruct",
         help="HuggingFace model ID",
     )
     parser.add_argument(

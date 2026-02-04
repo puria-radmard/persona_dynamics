@@ -180,8 +180,6 @@ class ActivationCapture:
     
     def _get_layer_module(self, layer_idx: int):
         """Get the module to hook for a given layer index."""
-        # This assumes a standard transformer architecture
-        # Adjust based on model architecture
         
         # Try common layer naming conventions
         if hasattr(self.model, 'model'):
@@ -190,6 +188,9 @@ class ActivationCapture:
         elif hasattr(self.model, 'transformer'):
             # GPT-style: model.transformer.h[i]
             base = self.model.transformer
+        elif hasattr(self.model, 'gpt_neox'):
+            # GPTNeoX-style: model.gpt_neox.layers[i]
+            base = self.model.gpt_neox
         else:
             base = self.model
         
@@ -390,6 +391,8 @@ def get_num_layers(model: AutoModelForCausalLM) -> int:
         return len(model.model.layers)
     elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
         return len(model.transformer.h)
+    elif hasattr(model, 'gpt_neox') and hasattr(model.gpt_neox, 'layers'):
+        return len(model.gpt_neox.layers)
     elif hasattr(model.config, 'num_hidden_layers'):
         return model.config.num_hidden_layers
     else:
