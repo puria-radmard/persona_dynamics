@@ -54,14 +54,20 @@ def parse_args() -> argparse.Namespace:
         "--filtering-dir",
         type=str,
         default=None,
-        help="Directory containing filtering results (optional)",
+        help="Directory containing filtering results (optional, ignored if --prep-activations)",
     )
     parser.add_argument(
         "--minimum-rating",
         type=int,
         default=2,
         choices=[1, 2, 3],
-        help="Minimum judge rating to include (default: 2)",
+        help="Minimum judge rating to include (default: 2, ignored if --prep-activations)",
+    )
+    parser.add_argument(
+        "--prep-activations",
+        action="store_true",
+        help="Use prefill-only activations (from activation_preparation). "
+             "Disables filtering since there are no responses to judge.",
     )
     
     return parser.parse_args()
@@ -273,10 +279,16 @@ def main():
     output_dir = activations_dir / "analyses"
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Setup filtering
-    filtering_dir = Path(args.filtering_dir) if args.filtering_dir else None
-    if filtering_dir and not filtering_dir.exists():
-        raise FileNotFoundError(f"Filtering directory not found: {filtering_dir}")
+    # Setup filtering (disabled for prep activations)
+    filtering_dir = None
+    if args.prep_activations:
+        logger.info("Using prefill activations - filtering disabled")
+        if args.filtering_dir:
+            logger.warning("--filtering-dir ignored when using --prep-activations")
+    else:
+        filtering_dir = Path(args.filtering_dir) if args.filtering_dir else None
+        if filtering_dir and not filtering_dir.exists():
+            raise FileNotFoundError(f"Filtering directory not found: {filtering_dir}")
     
     # Separate role and default files
     role_files, default_file = get_activation_files(activations_dir)
@@ -476,7 +488,9 @@ def main():
     ax.set_title(f'Variance & Assistant-PC Cosine Similarity (Axis↔PC1: {axis_pc1_cosine:.2f})')
     
     # Figure title
-    if filtering_dir:
+    if args.prep_activations:
+        suptitle = f"Assistant Axis Analysis: {len(roles)} roles (prefill activations)"
+    elif filtering_dir:
         total_kept = sum(c[0] for c in role_counts.values())
         total_samples = sum(c[1] for c in role_counts.values())
         suptitle = f"Assistant Axis Analysis: {len(roles)} roles (filtered: rating ≥ {args.minimum_rating}, {total_kept:,}/{total_samples:,} samples)"
@@ -502,9 +516,10 @@ def main():
         "layer": layer_idx,
         "n_roles": len(role_means),
         "n_components": pca.n_components_,
+        "prep_activations": args.prep_activations,
         "filtering": {
-            "enabled": filtering_dir is not None,
-            "minimum_rating": args.minimum_rating if filtering_dir else None,
+            "enabled": filtering_dir is not None and not args.prep_activations,
+            "minimum_rating": args.minimum_rating if filtering_dir and not args.prep_activations else None,
             "roles_missing_filtering": roles_missing_filtering if filtering_dir else [],
             "roles_no_passing": roles_no_passing if filtering_dir else [],
             "total_samples_kept": sum(c[0] for c in role_counts.values()) if role_counts else None,
@@ -544,7 +559,9 @@ def main():
     print(f"Roles: {len(role_means)}")
     print(f"Layer: {layer_idx}")
     
-    if filtering_dir:
+    if args.prep_activations:
+        print(f"\nMode: Prefill activations (no filtering)")
+    elif filtering_dir:
         total_kept = sum(c[0] for c in role_counts.values())
         total_samples = sum(c[1] for c in role_counts.values())
         print(f"\nFiltering: rating ≥ {args.minimum_rating}")
