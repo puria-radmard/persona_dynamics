@@ -10,7 +10,7 @@ CHECKPOINT="main"
 
 # List of base models to process (in reverse order)
 MODELS=(
-    # "geodesic-research/sfm_unfiltered_e2e_misalignment_upsampled_base"
+    "geodesic-research/sfm_unfiltered_e2e_misalignment_upsampled_base"
     "geodesic-research/sfm_unfiltered_e2e_alignment_upsampled_base"
     "geodesic-research/sfm_filtered_e2e_alignment_upsampled_base"
     "geodesic-research/sfm_baseline_filtered_base"

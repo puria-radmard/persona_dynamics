@@ -142,6 +142,100 @@ def get_response_token_mask(
     return torch.tensor(full_ids), response_start, response_end
 
 
+def format_prompt_for_generation(
+    tokenizer: AutoTokenizer,
+    system_prompt: str,
+    user_message: str,
+) -> torch.Tensor:
+    """
+    Format prompt ready for generation (with assistant header, no response).
+    Returns tokenized input_ids.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+    
+    try:
+        formatted = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception as e:
+        if "System role not supported" in str(e) or "system" in str(e).lower():
+            combined_message = f"{system_prompt}\n\n{user_message}"
+            messages = [{"role": "user", "content": combined_message}]
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            raise
+    
+    input_ids = tokenizer.encode(formatted, add_special_tokens=False)
+    return torch.tensor(input_ids)
+
+
+def extract_last_token_activations_batched(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    system_prompts: list[str],
+    user_messages: list[str],
+    layer_indices: list[int],
+    device: str = "cuda",
+) -> list[dict[int, torch.Tensor] | None]:
+    """
+    Extract activations at the last token position for a batch of prompts.
+    
+    Returns:
+        List of dicts, each mapping layer index to activation tensor of shape (hidden_dim,).
+    """
+    batch_size = len(system_prompts)
+    assert len(user_messages) == batch_size
+    
+    # Tokenize all prompts
+    all_ids = []
+    for i in range(batch_size):
+        ids = format_prompt_for_generation(tokenizer, system_prompts[i], user_messages[i])
+        all_ids.append(ids)
+    
+    # Left-pad to same length
+    max_len = max(ids.size(0) for ids in all_ids)
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    
+    padded_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+    
+    for i, ids in enumerate(all_ids):
+        seq_len = ids.size(0)
+        offset = max_len - seq_len
+        padded_ids[i, offset:] = ids
+        attention_mask[i, offset:] = 1
+    
+    # Forward pass
+    with torch.no_grad():
+        with ActivationCapture(model, layer_indices) as capture:
+            model(padded_ids.to(device), attention_mask=attention_mask.to(device))
+            activations = capture.get_activations()
+    
+    # Extract last token for each item
+    results = []
+    for i in range(batch_size):
+        try:
+            item_activations = {}
+            for layer_idx, acts in activations.items():
+                # acts shape: (batch_size, seq_len, hidden_dim)
+                # Last token is always at position -1 (right-aligned after left-padding)
+                item_activations[layer_idx] = acts[i, -1, :]
+            results.append(item_activations)
+        except Exception:
+            results.append(None)
+    
+    return results
+
+
 class ActivationCapture:
     """Context manager for capturing activations from model layers."""
     
